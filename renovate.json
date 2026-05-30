@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "minimumReleaseAge": "14 days",
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchUpdateTypes": ["major"],
+      "labels": ["breaking", "bump:major"]
+    },
+    {
+      "matchUpdateTypes": ["minor"],
+      "labels": ["enhancement", "bump:minor"]
+    },
+    {
+      "matchUpdateTypes": ["patch"],
+      "labels": ["patch", "bump:patch"]
+    },
+    {
+      "matchDepTypes": ["devDependencies"],
+      "labels": ["dev"]
+    }
+  ]
+}

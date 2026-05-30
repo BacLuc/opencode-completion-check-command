@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "command": {
+    "completion-check-command": {
+      "template": "The user wants to verify task completion after you finish. Run your task, and when you are done, a completion check will automatically run to verify your work.\n\nThe completion check command is:\n{{arguments}}",
+      "description": "Register a shell command that will be executed after the agent finishes to verify task completion. Include a markdown code block with the shell command to run."
+    }
+  },
+  "plugin": [["file:///workspaces/opencode-completion-check-command", {}]]
+}
