@@ -3,6 +3,7 @@
   "extends": ["config:recommended"],
   "minimumReleaseAge": "14 days",
   "labels": ["dependencies"],
+  "automerge": true,
   "packageRules": [
     {
       "matchUpdateTypes": ["major"],
