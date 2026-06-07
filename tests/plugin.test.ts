@@ -1,9 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { promises as fs } from 'fs'
 import {
   CompletionCheckCommandPlugin,
   CompletionCheckStore,
   DEFAULT_MAX_RETRIES,
   parseCodeBlock,
+  readDefaultCommandFromAgentsMd,
 } from '../src/completion-check-command.js'
 
 describe('parseCodeBlock', () => {
@@ -25,6 +27,39 @@ describe('parseCodeBlock', () => {
     ['empty string', '', null],
   ])('should parse %s', (_name, input, expected) => {
     expect(parseCodeBlock(input)).toBe(expected)
+  })
+})
+
+describe('readDefaultCommandFromAgentsMd', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  it('should return null if AGENTS.md does not exist', async () => {
+    vi.spyOn(fs, 'readFile').mockRejectedValue(new Error('ENOENT'))
+    const result = await readDefaultCommandFromAgentsMd('/test/dir')
+    expect(result).toBeNull()
+    expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+  })
+
+  it('should return null if AGENTS.md has no /completion-check-command', async () => {
+    vi.spyOn(fs, 'readFile').mockResolvedValue('# Some instructions\n\nDo something.')
+    const result = await readDefaultCommandFromAgentsMd('/test/dir')
+    expect(result).toBeNull()
+  })
+
+  it('should extract command from AGENTS.md with /completion-check-command', async () => {
+    vi.spyOn(fs, 'readFile').mockResolvedValue(
+      '# Instructions\n\nRun this after completion:\n/completion-check-command\n```bash\nnpm test\n```',
+    )
+    const result = await readDefaultCommandFromAgentsMd('/test/dir')
+    expect(result).toBe('npm test')
+  })
+
+  it('should return null if /completion-check-command exists but no code block', async () => {
+    vi.spyOn(fs, 'readFile').mockResolvedValue('Some text\n/completion-check-command\nMore text')
+    const result = await readDefaultCommandFromAgentsMd('/test/dir')
+    expect(result).toBeNull()
   })
 })
 
@@ -397,6 +432,132 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(failureCall.body.parts[0].text).toContain('you are not yet finished:')
       expect(failureCall.body.parts[0].text).toContain('some error output')
       expect(failureCall.body.parts[0].text).toContain('some stderr')
+    })
+
+    it('should use default command from AGENTS.md when no session command is set', async () => {
+      const mockShell = createMockShell(0, 'all good', '')
+      const mockInput = createMockInput(mockShell)
+
+      vi.spyOn(fs, 'readFile').mockResolvedValue(
+        '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
+      )
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-default',
+              directory: '/test/dir',
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'session-default' },
+        },
+      })
+
+      expect(mockShell).toHaveBeenCalled()
+      expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+
+      vi.restoreAllMocks()
+    })
+
+    it('should notify user when default command is found in AGENTS.md', async () => {
+      const mockShell = createMockShell(0, 'all good', '')
+      const mockInput = createMockInput(mockShell)
+
+      vi.spyOn(fs, 'readFile').mockResolvedValue(
+        '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
+      )
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-notify',
+              directory: '/test/dir',
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+      const callArgs = mockInput.client.tui.showToast.mock.calls[0][0]
+      expect(callArgs.body.title).toBe('Completion Check')
+      expect(callArgs.body.message).toContain('Found default completion check command in AGENTS.md')
+      expect(callArgs.body.message).toContain('./default-check.sh')
+      expect(callArgs.body.variant).toBe('info')
+      expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+
+      vi.restoreAllMocks()
+    })
+
+    it('should prefer session-specific command over AGENTS.md default', async () => {
+      const mockShell = createMockShell(0, 'all good', '')
+      const mockInput = createMockInput(mockShell)
+
+      vi.spyOn(fs, 'readFile').mockResolvedValue(
+        '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
+      )
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-override',
+              directory: '/test/dir',
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-override',
+          arguments: '```bash\n./session-check.sh\n```',
+        },
+        { parts },
+      )
+
+      await hooks['event']!({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'session-override' },
+        },
+      })
+
+      // Shell should have been called with some command (session-specific one)
+      expect(mockShell).toHaveBeenCalled()
+      expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+
+      vi.restoreAllMocks()
     })
   })
 
