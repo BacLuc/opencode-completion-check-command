@@ -1,5 +1,6 @@
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
 import type { Event } from '@opencode-ai/sdk'
+import { promises as fs } from 'fs'
 
 export const DEFAULT_MAX_RETRIES = 10
 
@@ -108,6 +109,19 @@ export function buildFailureMessage(result: CommandResult): string {
   return message
 }
 
+export async function readDefaultCommandFromAgentsMd(directory: string): Promise<string | null> {
+  try {
+    const content = await fs.readFile(`${directory}/AGENTS.md`, 'utf-8')
+    const commandIndex = content.indexOf('/completion-check-command')
+    if (commandIndex === -1) {
+      return null
+    }
+    return parseCodeBlock(content.slice(commandIndex))
+  } catch {
+    return null
+  }
+}
+
 export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
   const { client, $ } = input
   const maxRetries = typeof options?.maxRetries === 'number' ? options.maxRetries : DEFAULT_MAX_RETRIES
@@ -170,6 +184,31 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
     },
 
     event: async ({ event }) => {
+      if (event.type === 'session.created') {
+        const sessionID = (event as Extract<Event, { type: 'session.created' }>).properties.info.id
+        const directory = (event as Extract<Event, { type: 'session.created' }>).properties.info.directory
+        const defaultCommand = await readDefaultCommandFromAgentsMd(directory)
+
+        if (defaultCommand) {
+          store.set(sessionID, defaultCommand)
+
+          try {
+            await client.tui.showToast({
+              body: {
+                title: 'Completion Check',
+                message: `Found default completion check command in AGENTS.md. It will be run automatically when the agent finishes:\n\n\`\`\`bash\n${defaultCommand}\n\`\`\``,
+                variant: 'info',
+                duration: 10000,
+              },
+            })
+          } catch {
+            // Ignore feedback errors
+          }
+        }
+
+        return
+      }
+
       if (event.type !== 'session.idle') {
         return
       }

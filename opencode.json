@@ -6,5 +6,5 @@
       "description": "Register a shell command that will be executed after the agent finishes to verify task completion. Include a markdown code block with the shell command to run."
     }
   },
-  "plugin": [["file:///workspaces/opencode-completion-check-command", {}]]
+  "plugin": [[".", {}]]
 }
