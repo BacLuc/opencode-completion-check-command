@@ -137,10 +137,36 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
 
       const command = parseCodeBlock(input.arguments)
       if (!command) {
+        try {
+          await client.tui.showToast({
+            body: {
+              title: 'Completion Check',
+              message:
+                "I couldn't find a code block in your message. Please include a markdown code block with the shell command to run. For example:\n\n```bash\n./check.sh\n```",
+              variant: 'warning',
+              duration: 10000,
+            },
+          })
+        } catch {
+          // Ignore feedback errors
+        }
         return
       }
 
       store.set(input.sessionID, command)
+
+      try {
+        await client.tui.showToast({
+          body: {
+            title: 'Completion Check',
+            message: `Registered! When the agent finishes, this command will be run to verify completion:\n\n\`\`\`bash\n${command}\n\`\`\``,
+            variant: 'success',
+            duration: 10000,
+          },
+        })
+      } catch {
+        // Ignore feedback errors
+      }
     },
 
     event: async ({ event }) => {
