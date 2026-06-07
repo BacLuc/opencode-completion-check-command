@@ -154,6 +154,9 @@ function createMockInput(shellFn: ReturnType<typeof createMockShell>, options?: 
       session: {
         promptAsync: vi.fn().mockResolvedValue({ data: {} }),
       },
+      tui: {
+        showToast: vi.fn().mockResolvedValue({ data: {} }),
+      },
     },
     project: {
       id: 'test-project',
@@ -264,7 +267,7 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(mockShell).not.toHaveBeenCalled()
     })
 
-    it('should not record command if no code block in arguments', async () => {
+    it('should send warning feedback when no code block is found in arguments', async () => {
       const mockShell = vi.fn()
       const mockInput = createMockInput(mockShell)
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
@@ -279,15 +282,35 @@ describe('CompletionCheckCommandPlugin', () => {
         { parts },
       )
 
-      await hooks['event']!({
-        event: {
-          type: 'session.idle',
-          properties: { sessionID: 'session-nocode' },
-        },
-      })
-
       expect(mockShell).not.toHaveBeenCalled()
-      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+      const callArgs = mockInput.client.tui.showToast.mock.calls[0][0]
+      expect(callArgs.body.title).toBe('Completion Check')
+      expect(callArgs.body.message).toContain("couldn't find")
+      expect(callArgs.body.variant).toBe('warning')
+    })
+
+    it('should send confirmation feedback when command is registered', async () => {
+      const mockShell = vi.fn()
+      const mockInput = createMockInput(mockShell)
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-123',
+          arguments: '```bash\n./check.sh\n```',
+        },
+        { parts },
+      )
+
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+      const callArgs = mockInput.client.tui.showToast.mock.calls[0][0]
+      expect(callArgs.body.title).toBe('Completion Check')
+      expect(callArgs.body.message).toContain('Registered!')
+      expect(callArgs.body.message).toContain('./check.sh')
+      expect(callArgs.body.variant).toBe('success')
     })
   })
 
@@ -342,6 +365,7 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
     })
 
     it('should prompt the agent again when command fails', async () => {
@@ -367,11 +391,12 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
-      const callArgs = mockInput.client.session.promptAsync.mock.calls[0][0]
-      expect(callArgs.path.id).toBe('session-fail')
-      expect(callArgs.body.parts[0].text).toContain('you are not yet finished:')
-      expect(callArgs.body.parts[0].text).toContain('some error output')
-      expect(callArgs.body.parts[0].text).toContain('some stderr')
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+      const failureCall = mockInput.client.session.promptAsync.mock.calls[0][0]
+      expect(failureCall.path.id).toBe('session-fail')
+      expect(failureCall.body.parts[0].text).toContain('you are not yet finished:')
+      expect(failureCall.body.parts[0].text).toContain('some error output')
+      expect(failureCall.body.parts[0].text).toContain('some stderr')
     })
   })
 
@@ -401,6 +426,7 @@ describe('CompletionCheckCommandPlugin', () => {
       }
 
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(DEFAULT_MAX_RETRIES)
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
     })
 
     it('should stop prompting after max retries are exhausted', async () => {
@@ -431,6 +457,7 @@ describe('CompletionCheckCommandPlugin', () => {
       }
 
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(customMaxRetries)
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
     })
 
     it('should allow setting maxRetries to 0 to disable re-prompting entirely', async () => {
@@ -458,6 +485,7 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
     })
 
     it('should respect maxRetries=1 by allowing exactly one re-prompt', async () => {
@@ -485,6 +513,7 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
 
       await hooks['event']!({
         event: {
@@ -494,6 +523,7 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
     })
   })
 })
