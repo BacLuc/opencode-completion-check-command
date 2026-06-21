@@ -5,5 +5,7 @@ export {
   CompletionCheckStore,
   executeCommand,
   buildFailureMessage,
+  isUsageLimitError,
+  sessionHitUsageLimit,
 } from './completion-check-command.js'
 export type { CommandResult } from './completion-check-command.js'

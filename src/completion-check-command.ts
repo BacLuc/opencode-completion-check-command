@@ -1,4 +1,4 @@
-import type { Hooks, Plugin } from '@opencode-ai/plugin'
+import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
 import type { Event } from '@opencode-ai/sdk'
 import { promises as fs } from 'fs'
 import { exec } from 'child_process'
@@ -123,6 +123,60 @@ export function buildFailureMessage(result: CommandResult): string {
   return message
 }
 
+/**
+ * Detects whether an error attached to an assistant message means the provider's
+ * usage limit was used up (rate limit, quota or credits exhausted). When that
+ * happens the agent did not actually finish its task — it was cut off — so the
+ * completion check must not run and the agent must not be re-prompted (which
+ * would immediately hit the same limit again and burn the retry budget).
+ */
+export function isUsageLimitError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false
+  }
+  const { name, data } = error as { name?: string; data?: Record<string, unknown> }
+  const statusCode = typeof data?.statusCode === 'number' ? data.statusCode : undefined
+
+  // HTTP 429 from the provider always means rate / usage limit reached.
+  if (name === 'APIError' && statusCode === 429) {
+    return true
+  }
+
+  // Otherwise fall back to matching the human-readable message / response body,
+  // which is how quota/credit exhaustion surfaces across providers.
+  const message = typeof data?.message === 'string' ? data.message : ''
+  const responseBody = typeof data?.responseBody === 'string' ? data.responseBody : ''
+  const haystack = `${message} ${responseBody}`.toLowerCase()
+
+  return /usage limit|rate limit|quota|too many requests|credit balance|out of credits|insufficient (?:credit|balance|funds|quota)/.test(
+    haystack,
+  )
+}
+
+/**
+ * Returns true when the session's most recent assistant message ended with a
+ * usage-limit error, i.e. the model ran out of usage rather than finishing.
+ */
+export async function sessionHitUsageLimit(client: PluginInput['client'], sessionID: string): Promise<boolean> {
+  try {
+    const response = await client.session.messages({ path: { id: sessionID } })
+    const messages = response?.data
+    if (!Array.isArray(messages)) {
+      return false
+    }
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const info = messages[i]?.info
+      if (info?.role === 'assistant') {
+        return isUsageLimitError(info.error)
+      }
+    }
+    return false
+  } catch {
+    // If we cannot determine the state, fall back to the normal behaviour.
+    return false
+  }
+}
+
 export async function readDefaultCommandFromAgentsMd(directory: string): Promise<string | null> {
   try {
     const content = await fs.readFile(`${directory}/AGENTS.md`, 'utf-8')
@@ -239,6 +293,26 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
       processing.add(sessionID)
 
       try {
+        if (await sessionHitUsageLimit(client, sessionID)) {
+          // The agent was cut off by the provider's usage limit rather than
+          // finishing. Skip the completion check (and the re-prompt) so we don't
+          // immediately hit the limit again. The command stays registered, so the
+          // check still runs once the session is able to continue.
+          try {
+            await client.tui.showToast({
+              body: {
+                title: 'Completion Check',
+                message: 'Skipped the completion check because the usage limit was reached.',
+                variant: 'warning',
+                duration: 10000,
+              },
+            })
+          } catch {
+            // Ignore feedback errors
+          }
+          return
+        }
+
         const result = await executeCommand(command, input.directory)
 
         if (result.exitCode === 0) {

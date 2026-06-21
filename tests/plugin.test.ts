@@ -5,6 +5,7 @@ import {
   CompletionCheckStore,
   DEFAULT_MAX_RETRIES,
   executeCommand,
+  isUsageLimitError,
   parseCodeBlock,
   readDefaultCommandFromAgentsMd,
 } from '../src/completion-check-command.js'
@@ -184,6 +185,9 @@ function createMockInput(options?: Record<string, unknown>) {
     client: {
       session: {
         promptAsync: vi.fn().mockResolvedValue({ data: {} }),
+        // By default there are no messages, so no usage-limit error is detected
+        // and the plugin behaves normally. Individual tests override this.
+        messages: vi.fn().mockResolvedValue({ data: [] }),
       },
       tui: {
         showToast: vi.fn().mockResolvedValue({ data: {} }),
@@ -233,6 +237,51 @@ describe('executeCommand (real execution)', () => {
     expect(result.exitCode).not.toBe(0)
   })
 })
+
+describe('isUsageLimitError', () => {
+  it.each([
+    ['APIError with HTTP 429', { name: 'APIError', data: { statusCode: 429, message: 'Too Many Requests' } }, true],
+    [
+      'APIError mentioning usage limit',
+      { name: 'APIError', data: { statusCode: 400, message: 'Usage limit reached' } },
+      true,
+    ],
+    ['error mentioning rate limit', { name: 'UnknownError', data: { message: 'You have hit the rate limit' } }, true],
+    [
+      'provider auth error about credit balance',
+      { name: 'ProviderAuthError', data: { providerID: 'anthropic', message: 'Your credit balance is too low' } },
+      true,
+    ],
+    [
+      'error mentioning quota in the response body',
+      { name: 'APIError', data: { statusCode: 403, message: 'Forbidden', responseBody: '{"error":"quota exceeded"}' } },
+      true,
+    ],
+    [
+      'error mentioning out of credits',
+      { name: 'APIError', data: { statusCode: 402, message: 'Payment required: out of credits' } },
+      true,
+    ],
+    ['unrelated API error', { name: 'APIError', data: { statusCode: 500, message: 'Internal Server Error' } }, false],
+    ['aborted message', { name: 'MessageAbortedError', data: { message: 'aborted' } }, false],
+    ['undefined error', undefined, false],
+    ['null error', null, false],
+    ['empty object', {}, false],
+  ])('should detect %s', (_name, error, expected) => {
+    expect(isUsageLimitError(error)).toBe(expected)
+  })
+})
+
+// Builds a messages response as returned by client.session.messages, ending in
+// an assistant message carrying the given error (or none).
+function messagesWithAssistantError(error?: unknown) {
+  return {
+    data: [
+      { info: { role: 'user', id: 'msg-user' }, parts: [] },
+      { info: { role: 'assistant', id: 'msg-assistant', error }, parts: [] },
+    ],
+  }
+}
 
 describe('CompletionCheckCommandPlugin', () => {
   describe('hook registration', () => {
@@ -570,6 +619,97 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
 
       vi.restoreAllMocks()
+    })
+  })
+
+  describe('usage limit handling', () => {
+    it('should skip the completion check and not re-prompt when the usage limit was reached', async () => {
+      const mockInput = createMockInput()
+      mockInput.client.session.messages.mockResolvedValue(
+        messagesWithAssistantError({ name: 'APIError', data: { statusCode: 429, message: 'Too Many Requests' } }),
+      )
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-usage',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'session-usage' },
+        },
+      })
+
+      // The check did not run, so the agent was not re-prompted.
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+      // A warning toast explains why the check was skipped.
+      const toastMessages = mockInput.client.tui.showToast.mock.calls.map((c: any[]) => c[0].body.message)
+      expect(toastMessages.some((m: string) => m.toLowerCase().includes('usage limit'))).toBe(true)
+    })
+
+    it('should keep the command registered and run it once the usage limit clears', async () => {
+      const mockInput = createMockInput()
+      mockInput.client.session.messages.mockResolvedValue(
+        messagesWithAssistantError({ name: 'APIError', data: { statusCode: 429 } }),
+      )
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-usage-clear',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      // First idle: usage limit reached -> skipped, no re-prompt.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-usage-clear' } },
+      })
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+
+      // Usage limit clears (no error on the last assistant message).
+      mockInput.client.session.messages.mockResolvedValue(messagesWithAssistantError(undefined))
+
+      // Second idle: the still-registered command runs and (failing) re-prompts.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-usage-clear' } },
+      })
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+    })
+
+    it('should still run the check when the last assistant error is unrelated to usage limits', async () => {
+      const mockInput = createMockInput()
+      mockInput.client.session.messages.mockResolvedValue(
+        messagesWithAssistantError({ name: 'APIError', data: { statusCode: 500, message: 'Internal Server Error' } }),
+      )
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-other-error',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-other-error' } },
+      })
+
+      // Unrelated error -> normal behaviour: failing command re-prompts the agent.
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
     })
   })
 
