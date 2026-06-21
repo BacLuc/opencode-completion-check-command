@@ -1,6 +1,7 @@
-import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
+import type { Hooks, Plugin } from '@opencode-ai/plugin'
 import type { Event } from '@opencode-ai/sdk'
 import { promises as fs } from 'fs'
+import { exec } from 'child_process'
 
 export const DEFAULT_MAX_RETRIES = 10
 
@@ -78,21 +79,34 @@ export interface CommandResult {
   stderr: string
 }
 
-export async function executeCommand($: PluginInput['$'], command: string, cwd: string): Promise<CommandResult> {
-  try {
-    const result = await $`${command}`.nothrow().quiet().cwd(cwd)
-    return {
-      exitCode: result.exitCode,
-      stdout: result.text(),
-      stderr: result.stderr.toString(),
-    }
-  } catch (error) {
-    return {
-      exitCode: 1,
-      stdout: '',
-      stderr: error instanceof Error ? error.message : String(error),
-    }
-  }
+/**
+ * Runs the completion check command in a real system shell (`/bin/sh -c`).
+ *
+ * The previous implementation used opencode's built-in Bun shell via
+ * `` $`${command}` ``. Bun interpolates the whole command string as a single
+ * quoted argument and resolves binaries against its own restricted PATH, which
+ * breaks commands such as `docker compose run ...` with errors like
+ * "Bun: command not found: docker" even though `docker` is on the user's PATH.
+ *
+ * Using `child_process.exec` runs the command through the real `/bin/sh`, so
+ * the command line is parsed normally and binaries are resolved against the
+ * inherited PATH exactly like in a normal terminal (including `/sbin`,
+ * `/usr/sbin`, etc.).
+ */
+export async function executeCommand(command: string, cwd: string): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    exec(command, { cwd, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      let exitCode = 0
+      if (error) {
+        exitCode = typeof error.code === 'number' ? error.code : 1
+      }
+      resolve({
+        exitCode,
+        stdout: stdout.toString(),
+        stderr: stderr.toString(),
+      })
+    })
+  })
 }
 
 export function buildFailureMessage(result: CommandResult): string {
@@ -123,7 +137,7 @@ export async function readDefaultCommandFromAgentsMd(directory: string): Promise
 }
 
 export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
-  const { client, $ } = input
+  const { client } = input
   const maxRetries = typeof options?.maxRetries === 'number' ? options.maxRetries : DEFAULT_MAX_RETRIES
   const store = new CompletionCheckStore(maxRetries)
 
@@ -225,7 +239,7 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
       processing.add(sessionID)
 
       try {
-        const result = await executeCommand($, command, input.directory)
+        const result = await executeCommand(command, input.directory)
 
         if (result.exitCode === 0) {
           store.delete(sessionID)

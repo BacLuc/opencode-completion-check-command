@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { promises as fs } from 'fs'
 import {
   CompletionCheckCommandPlugin,
   CompletionCheckStore,
   DEFAULT_MAX_RETRIES,
+  executeCommand,
   parseCodeBlock,
   readDefaultCommandFromAgentsMd,
 } from '../src/completion-check-command.js'
@@ -168,22 +169,17 @@ describe('CompletionCheckStore', () => {
   })
 })
 
-function createMockShell(exitCode: number, stdout: string, stderr: string) {
-  const result = {
-    exitCode,
-    text: () => stdout,
-    stderr: { toString: () => stderr },
-  }
-  return vi.fn().mockReturnValue({
-    nothrow: () => ({
-      quiet: () => ({
-        cwd: () => Promise.resolve(result),
-      }),
-    }),
-  })
+// A few real shell commands used by the integration-style plugin tests below.
+// They run through the real `/bin/sh`, exactly like the plugin does in
+// production, so no shell mocking is needed.
+const SUCCESS_COMMAND = 'true'
+const FAIL_COMMAND = 'echo some error output; echo some stderr 1>&2; exit 1'
+
+function codeBlock(command: string): string {
+  return '```bash\n' + command + '\n```'
 }
 
-function createMockInput(shellFn: ReturnType<typeof createMockShell>, options?: Record<string, unknown>) {
+function createMockInput(options?: Record<string, unknown>) {
   return {
     client: {
       session: {
@@ -199,20 +195,49 @@ function createMockInput(shellFn: ReturnType<typeof createMockShell>, options?: 
       vcsDir: '/test',
       time: { created: Date.now() },
     },
-    directory: '/test/dir',
-    worktree: '/test',
-    $: shellFn,
+    // A real, existing working directory so the spawned shell can chdir into it.
+    directory: process.cwd(),
+    worktree: process.cwd(),
     serverUrl: new URL('http://localhost:12345'),
     experimental_workspace: { register: vi.fn() },
     ...(options || {}),
   }
 }
 
+describe('executeCommand (real execution)', () => {
+  it('should run a command available in /sbin via the real PATH', async () => {
+    // `sysctl` lives in /sbin (resp. /usr/sbin) and is available in every
+    // terminal. This proves the command is resolved against the real PATH the
+    // way a normal shell does, which is exactly what broke for `docker` before.
+    const result = await executeCommand('sysctl -n kernel.ostype', process.cwd())
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe('Linux')
+    expect(result.stderr).toBe('')
+  })
+
+  it('should run a multi-word command and capture stdout', async () => {
+    const result = await executeCommand('echo hello world', process.cwd())
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe('hello world')
+  })
+
+  it('should capture a non-zero exit code together with stdout and stderr', async () => {
+    const result = await executeCommand('echo out; echo err 1>&2; exit 3', process.cwd())
+    expect(result.exitCode).toBe(3)
+    expect(result.stdout).toContain('out')
+    expect(result.stderr).toContain('err')
+  })
+
+  it('should report a non-zero exit code for an unknown command', async () => {
+    const result = await executeCommand('this-command-definitely-does-not-exist-xyz', process.cwd())
+    expect(result.exitCode).not.toBe(0)
+  })
+})
+
 describe('CompletionCheckCommandPlugin', () => {
   describe('hook registration', () => {
     it('should return hooks with command.execute.before, config, and event handlers', async () => {
-      const mockShell = createMockShell(0, '', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
       expect(hooks['command.execute.before']).toBeDefined()
       expect(hooks['event']).toBeDefined()
@@ -222,8 +247,7 @@ describe('CompletionCheckCommandPlugin', () => {
 
   describe('config hook', () => {
     it('should register the completion-check-command in config', async () => {
-      const mockShell = createMockShell(0, '', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
       const config: any = {}
       await hooks.config!(config)
@@ -234,8 +258,7 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should not overwrite existing command config', async () => {
-      const mockShell = createMockShell(0, '', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
       const customTemplate = 'Custom template {{arguments}}'
       const config: any = {
@@ -252,9 +275,8 @@ describe('CompletionCheckCommandPlugin', () => {
   })
 
   describe('command recording', () => {
-    it('should record command when /completion-check-command is invoked with a code block', async () => {
-      const mockShell = createMockShell(0, '', '')
-      const mockInput = createMockInput(mockShell)
+    it('should record and run the command when /completion-check-command is invoked with a code block', async () => {
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -262,7 +284,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-123',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -274,12 +296,12 @@ describe('CompletionCheckCommandPlugin', () => {
         },
       })
 
-      expect(mockShell).toHaveBeenCalled()
+      // The recorded (failing) command ran, so the agent was re-prompted.
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
     })
 
     it('should not record command for other commands', async () => {
-      const mockShell = vi.fn()
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -287,7 +309,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'other-command',
           sessionID: 'session-123',
-          arguments: '```bash\necho hi\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -299,12 +321,11 @@ describe('CompletionCheckCommandPlugin', () => {
         },
       })
 
-      expect(mockShell).not.toHaveBeenCalled()
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
     })
 
     it('should send warning feedback when no code block is found in arguments', async () => {
-      const mockShell = vi.fn()
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -317,7 +338,7 @@ describe('CompletionCheckCommandPlugin', () => {
         { parts },
       )
 
-      expect(mockShell).not.toHaveBeenCalled()
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
       expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
       const callArgs = mockInput.client.tui.showToast.mock.calls[0][0]
       expect(callArgs.body.title).toBe('Completion Check')
@@ -326,8 +347,7 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should send confirmation feedback when command is registered', async () => {
-      const mockShell = vi.fn()
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -335,7 +355,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-123',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock('./check.sh'),
         },
         { parts },
       )
@@ -351,8 +371,7 @@ describe('CompletionCheckCommandPlugin', () => {
 
   describe('event handling', () => {
     it('should ignore non-idle events', async () => {
-      const mockShell = vi.fn()
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -360,7 +379,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-abc',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -372,14 +391,13 @@ describe('CompletionCheckCommandPlugin', () => {
         },
       })
 
-      expect(mockShell).not.toHaveBeenCalled()
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
     })
   })
 
   describe('command execution on idle', () => {
     it('should not prompt again when command succeeds', async () => {
-      const mockShell = createMockShell(0, 'all good', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -387,7 +405,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-ok',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(SUCCESS_COMMAND),
         },
         { parts },
       )
@@ -403,9 +421,8 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
     })
 
-    it('should prompt the agent again when command fails', async () => {
-      const mockShell = createMockShell(1, 'some error output', 'some stderr')
-      const mockInput = createMockInput(mockShell)
+    it('should prompt the agent again with stdout and stderr when command fails', async () => {
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -413,7 +430,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-fail',
-          arguments: '```bash\n./failing-check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -435,12 +452,9 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should use default command from AGENTS.md when no session command is set', async () => {
-      const mockShell = createMockShell(0, 'all good', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
 
-      vi.spyOn(fs, 'readFile').mockResolvedValue(
-        '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
-      )
+      vi.spyOn(fs, 'readFile').mockResolvedValue('# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND))
 
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
@@ -450,7 +464,7 @@ describe('CompletionCheckCommandPlugin', () => {
           properties: {
             info: {
               id: 'session-default',
-              directory: '/test/dir',
+              directory: process.cwd(),
               projectID: 'test-project',
               title: 'Test Session',
               version: '1',
@@ -467,15 +481,15 @@ describe('CompletionCheckCommandPlugin', () => {
         },
       })
 
-      expect(mockShell).toHaveBeenCalled()
-      expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+      // The failing default command from AGENTS.md ran and re-prompted the agent.
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      expect(fs.readFile).toHaveBeenCalledWith(process.cwd() + '/AGENTS.md', 'utf-8')
 
       vi.restoreAllMocks()
     })
 
     it('should notify user when default command is found in AGENTS.md', async () => {
-      const mockShell = createMockShell(0, 'all good', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
 
       vi.spyOn(fs, 'readFile').mockResolvedValue(
         '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
@@ -511,12 +525,10 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should prefer session-specific command over AGENTS.md default', async () => {
-      const mockShell = createMockShell(0, 'all good', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
 
-      vi.spyOn(fs, 'readFile').mockResolvedValue(
-        '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
-      )
+      // AGENTS.md default would fail (and re-prompt) ...
+      vi.spyOn(fs, 'readFile').mockResolvedValue('# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND))
 
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
@@ -526,7 +538,7 @@ describe('CompletionCheckCommandPlugin', () => {
           properties: {
             info: {
               id: 'session-override',
-              directory: '/test/dir',
+              directory: process.cwd(),
               projectID: 'test-project',
               title: 'Test Session',
               version: '1',
@@ -536,12 +548,13 @@ describe('CompletionCheckCommandPlugin', () => {
         },
       })
 
+      // ... but the session-specific command succeeds, overriding the default.
       const parts: any[] = []
       await hooks['command.execute.before']!(
         {
           command: 'completion-check-command',
           sessionID: 'session-override',
-          arguments: '```bash\n./session-check.sh\n```',
+          arguments: codeBlock(SUCCESS_COMMAND),
         },
         { parts },
       )
@@ -553,18 +566,16 @@ describe('CompletionCheckCommandPlugin', () => {
         },
       })
 
-      // Shell should have been called with some command (session-specific one)
-      expect(mockShell).toHaveBeenCalled()
-      expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+      // Session-specific (succeeding) command was used, so no re-prompt.
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
 
       vi.restoreAllMocks()
     })
   })
 
   describe('max retries', () => {
-    it('should use the default max retries (3) when no option is provided', async () => {
-      const mockShell = createMockShell(1, 'error', '')
-      const mockInput = createMockInput(mockShell)
+    it('should use the default max retries when no option is provided', async () => {
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
       const parts: any[] = []
@@ -572,7 +583,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-retry',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -591,9 +602,8 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should stop prompting after max retries are exhausted', async () => {
-      const mockShell = createMockShell(1, 'error', '')
       const customMaxRetries = 2
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any, {
         maxRetries: customMaxRetries,
       })
@@ -603,7 +613,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-retry2',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -622,8 +632,7 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should allow setting maxRetries to 0 to disable re-prompting entirely', async () => {
-      const mockShell = createMockShell(1, 'error', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any, {
         maxRetries: 0,
       })
@@ -633,7 +642,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-no-retry',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
@@ -650,8 +659,7 @@ describe('CompletionCheckCommandPlugin', () => {
     })
 
     it('should respect maxRetries=1 by allowing exactly one re-prompt', async () => {
-      const mockShell = createMockShell(1, 'error', '')
-      const mockInput = createMockInput(mockShell)
+      const mockInput = createMockInput()
       const hooks = await CompletionCheckCommandPlugin(mockInput as any, {
         maxRetries: 1,
       })
@@ -661,7 +669,7 @@ describe('CompletionCheckCommandPlugin', () => {
         {
           command: 'completion-check-command',
           sessionID: 'session-one-retry',
-          arguments: '```bash\n./check.sh\n```',
+          arguments: codeBlock(FAIL_COMMAND),
         },
         { parts },
       )
