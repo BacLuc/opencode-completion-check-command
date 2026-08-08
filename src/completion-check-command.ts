@@ -190,6 +190,48 @@ export async function readDefaultCommandFromAgentsMd(directory: string): Promise
   }
 }
 
+async function readFileIfExists(filePath: string): Promise<string | null> {
+  try {
+    return await fs.readFile(filePath, 'utf-8')
+  } catch {
+    return null
+  }
+}
+
+async function readDefaultCommandFromDotfile(filePath: string): Promise<string | null> {
+  const content = await readFileIfExists(filePath)
+  if (!content) {
+    return null
+  }
+  const trimmed = content.trim()
+  return trimmed || null
+}
+
+export async function readDefaultCommand(
+  directory: string,
+): Promise<{ command: string | null; source: string | null }> {
+  const agentsDotfile = `${directory}/.agents/.completion-check-command`
+  const opencodeDotfile = `${directory}/.opencode/.completion-check-command`
+  const agentsMd = `${directory}/AGENTS.md`
+
+  let command = await readDefaultCommandFromDotfile(agentsDotfile)
+  if (command) {
+    return { command, source: '.agents/.completion-check-command' }
+  }
+
+  command = await readDefaultCommandFromDotfile(opencodeDotfile)
+  if (command) {
+    return { command, source: '.opencode/.completion-check-command' }
+  }
+
+  command = await readDefaultCommandFromAgentsMd(directory)
+  if (command) {
+    return { command, source: 'AGENTS.md' }
+  }
+
+  return { command: null, source: null }
+}
+
 export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
   const { client } = input
   const maxRetries = typeof options?.maxRetries === 'number' ? options.maxRetries : DEFAULT_MAX_RETRIES
@@ -255,16 +297,16 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
       if (event.type === 'session.created') {
         const sessionID = (event as Extract<Event, { type: 'session.created' }>).properties.info.id
         const directory = (event as Extract<Event, { type: 'session.created' }>).properties.info.directory
-        const defaultCommand = await readDefaultCommandFromAgentsMd(directory)
+        const { command: defaultCommand, source } = await readDefaultCommand(directory)
 
-        if (defaultCommand) {
+        if (defaultCommand && source) {
           store.set(sessionID, defaultCommand)
 
           try {
             await client.tui.showToast({
               body: {
                 title: 'Completion Check',
-                message: `Found default completion check command in AGENTS.md. It will be run automatically when the agent finishes:\n\n\`\`\`bash\n${defaultCommand}\n\`\`\``,
+                message: `Found default completion check command in ${source}. It will be run automatically when the agent finishes:\n\n\`\`\`bash\n${defaultCommand}\n\`\`\``,
                 variant: 'info',
                 duration: 10000,
               },

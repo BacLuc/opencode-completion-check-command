@@ -8,6 +8,7 @@ import {
   isUsageLimitError,
   parseCodeBlock,
   readDefaultCommandFromAgentsMd,
+  readDefaultCommand,
 } from '../src/completion-check-command.js'
 
 describe('parseCodeBlock', () => {
@@ -38,30 +39,105 @@ describe('readDefaultCommandFromAgentsMd', () => {
   })
 
   it('should return null if AGENTS.md does not exist', async () => {
-    vi.spyOn(fs, 'readFile').mockRejectedValue(new Error('ENOENT'))
+    mockFsFiles([['/test/dir/AGENTS.md', new Error('ENOENT')]])
     const result = await readDefaultCommandFromAgentsMd('/test/dir')
     expect(result).toBeNull()
     expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
   })
 
   it('should return null if AGENTS.md has no /completion-check-command', async () => {
-    vi.spyOn(fs, 'readFile').mockResolvedValue('# Some instructions\n\nDo something.')
+    mockFsFiles([['/test/dir/AGENTS.md', '# Some instructions\n\nDo something.']])
     const result = await readDefaultCommandFromAgentsMd('/test/dir')
     expect(result).toBeNull()
   })
 
   it('should extract command from AGENTS.md with /completion-check-command', async () => {
-    vi.spyOn(fs, 'readFile').mockResolvedValue(
-      '# Instructions\n\nRun this after completion:\n/completion-check-command\n```bash\nnpm test\n```',
-    )
+    mockFsFiles([
+      [
+        '/test/dir/AGENTS.md',
+        '# Instructions\n\nRun this after completion:\n/completion-check-command\n```bash\nnpm test\n```',
+      ],
+    ])
     const result = await readDefaultCommandFromAgentsMd('/test/dir')
     expect(result).toBe('npm test')
   })
 
   it('should return null if /completion-check-command exists but no code block', async () => {
-    vi.spyOn(fs, 'readFile').mockResolvedValue('Some text\n/completion-check-command\nMore text')
+    mockFsFiles([['/test/dir/AGENTS.md', 'Some text\n/completion-check-command\nMore text']])
     const result = await readDefaultCommandFromAgentsMd('/test/dir')
     expect(result).toBeNull()
+  })
+})
+
+describe('readDefaultCommand', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  it('returns command from .agents/.completion-check-command when it exists', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', 'npm test\n'],
+      ['/test/dir/.opencode/.completion-check-command', 'echo opencode'],
+      ['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n```bash\nnpm run test\n```'],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('npm test')
+    expect(result.source).toBe('.agents/.completion-check-command')
+  })
+
+  it('falls back to .opencode/.completion-check-command when .agents/ is missing', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.opencode/.completion-check-command', 'echo opencode'],
+      ['/test/dir/AGENTS.md', new Error('ENOENT')],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('echo opencode')
+    expect(result.source).toBe('.opencode/.completion-check-command')
+  })
+
+  it('falls back to AGENTS.md when both dotfiles are missing', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.opencode/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n```bash\nnpm test\n```'],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('npm test')
+    expect(result.source).toBe('AGENTS.md')
+  })
+
+  it('returns null when all three are missing', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.opencode/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/AGENTS.md', new Error('ENOENT')],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBeNull()
+    expect(result.source).toBeNull()
+  })
+
+  it('returns null when file exists but is empty/whitespace-only', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', '   \n\n  '],
+      ['/test/dir/.opencode/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/AGENTS.md', new Error('ENOENT')],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBeNull()
+    expect(result.source).toBeNull()
+  })
+
+  it('gives .agents priority when all three exist', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', './agents-check.sh'],
+      ['/test/dir/.opencode/.completion-check-command', './opencode-check.sh'],
+      ['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n```bash\n./md-check.sh\n```'],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('./agents-check.sh')
+    expect(result.source).toBe('.agents/.completion-check-command')
   })
 })
 
@@ -178,6 +254,21 @@ const FAIL_COMMAND = 'echo some error output; echo some stderr 1>&2; exit 1'
 
 function codeBlock(command: string): string {
   return '```bash\n' + command + '\n```'
+}
+
+function mockFsFiles(entries: Array<[string, string | Error]>) {
+  const files = new Map<string, string | Error>(entries)
+  return vi.spyOn(fs, 'readFile').mockImplementation(async (path) => {
+    const key = String(path)
+    const value = files.get(key)
+    if (value instanceof Error) {
+      throw value
+    }
+    if (value !== undefined) {
+      return value
+    }
+    throw new Error(`ENOENT: ${key}`)
+  })
 }
 
 function createMockInput(options?: Record<string, unknown>) {
@@ -503,7 +594,9 @@ describe('CompletionCheckCommandPlugin', () => {
     it('should use default command from AGENTS.md when no session command is set', async () => {
       const mockInput = createMockInput()
 
-      vi.spyOn(fs, 'readFile').mockResolvedValue('# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND))
+      mockFsFiles([
+        [`${process.cwd()}/AGENTS.md`, '# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND)],
+      ])
 
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
@@ -540,9 +633,9 @@ describe('CompletionCheckCommandPlugin', () => {
     it('should notify user when default command is found in AGENTS.md', async () => {
       const mockInput = createMockInput()
 
-      vi.spyOn(fs, 'readFile').mockResolvedValue(
-        '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```',
-      )
+      mockFsFiles([
+        ['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n```bash\n./default-check.sh\n```'],
+      ])
 
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
@@ -569,6 +662,123 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(callArgs.body.message).toContain('./default-check.sh')
       expect(callArgs.body.variant).toBe('info')
       expect(fs.readFile).toHaveBeenCalledWith('/test/dir/AGENTS.md', 'utf-8')
+
+      vi.restoreAllMocks()
+    })
+
+    it('should use default command from .opencode/.completion-check-command on session.created', async () => {
+      const mockInput = createMockInput()
+
+      mockFsFiles([
+        [`${process.cwd()}/.opencode/.completion-check-command`, FAIL_COMMAND],
+        [`${process.cwd()}/AGENTS.md`, new Error('ENOENT')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-opencode-dotfile',
+              directory: process.cwd(),
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'session-opencode-dotfile' },
+        },
+      })
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      expect(fs.readFile).toHaveBeenCalledWith(process.cwd() + '/.opencode/.completion-check-command', 'utf-8')
+
+      vi.restoreAllMocks()
+    })
+
+    it('should use default command from .agents/.completion-check-command on session.created', async () => {
+      const mockInput = createMockInput()
+
+      mockFsFiles([
+        [`${process.cwd()}/.agents/.completion-check-command`, FAIL_COMMAND],
+        [`${process.cwd()}/.opencode/.completion-check-command`, new Error('ENOENT')],
+        [`${process.cwd()}/AGENTS.md`, new Error('ENOENT')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-agents-dotfile',
+              directory: process.cwd(),
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'session-agents-dotfile' },
+        },
+      })
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      expect(fs.readFile).toHaveBeenCalledWith(process.cwd() + '/.agents/.completion-check-command', 'utf-8')
+
+      vi.restoreAllMocks()
+    })
+
+    it('should notify user with correct source when default command is found in .opencode/.completion-check-command', async () => {
+      const mockInput = createMockInput()
+
+      mockFsFiles([
+        ['/test/dir/.opencode/.completion-check-command', './default-check.sh'],
+        ['/test/dir/AGENTS.md', new Error('ENOENT')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-notify-opencode',
+              directory: '/test/dir',
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+      const callArgs = mockInput.client.tui.showToast.mock.calls[0][0]
+      expect(callArgs.body.title).toBe('Completion Check')
+      expect(callArgs.body.message).toContain(
+        'Found default completion check command in .opencode/.completion-check-command',
+      )
+      expect(callArgs.body.message).toContain('./default-check.sh')
+      expect(callArgs.body.variant).toBe('info')
 
       vi.restoreAllMocks()
     })
