@@ -7,5 +7,6 @@ export {
   buildFailureMessage,
   isUsageLimitError,
   sessionHitUsageLimit,
+  readDefaultCommand,
 } from './completion-check-command.js'
 export type { CommandResult } from './completion-check-command.js'
