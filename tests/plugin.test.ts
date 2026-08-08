@@ -558,7 +558,42 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
-      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(2)
+    })
+
+    it('should show success toast and log when command succeeds', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-success',
+          arguments: codeBlock(SUCCESS_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'session-success' },
+        },
+      })
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+      expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(2)
+
+      const successToastCall = mockInput.client.tui.showToast.mock.calls[1][0]
+      expect(successToastCall.body.title).toBe('Completion Check')
+      expect(successToastCall.body.message).toContain('succeeded')
+      expect(successToastCall.body.variant).toBe('success')
+
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[Completion Check] Command succeeded'))
+
+      consoleSpy.mockRestore()
     })
 
     it('should prompt the agent again with stdout and stderr when command fails', async () => {

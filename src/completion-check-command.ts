@@ -359,6 +359,22 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
 
         if (result.exitCode === 0) {
           store.delete(sessionID)
+
+          console.log(`[Completion Check] Command succeeded. Task is complete.\nCommand: ${command}`)
+
+          try {
+            await client.tui.showToast({
+              body: {
+                title: 'Completion Check',
+                message: `Command succeeded! Task is complete.\n\n\`\`\`bash\n${command}\n\`\`\``,
+                variant: 'success',
+                duration: 10000,
+              },
+            })
+          } catch {
+            // Ignore feedback errors
+          }
+
           return
         }
 
