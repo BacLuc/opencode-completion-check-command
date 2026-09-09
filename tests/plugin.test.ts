@@ -153,6 +153,15 @@ describe('CompletionCheckStore', () => {
     expect(store.get('session-1')).toBe('./check.sh')
   })
 
+  it('should store and retrieve directory', () => {
+    store.set('session-1', './check.sh', '/some/dir')
+    expect(store.getDirectory('session-1')).toBe('/some/dir')
+  })
+
+  it('should return undefined directory for unknown session', () => {
+    expect(store.getDirectory('unknown')).toBeUndefined()
+  })
+
   it('should return undefined for unknown session', () => {
     expect(store.get('unknown')).toBeUndefined()
   })
@@ -1078,6 +1087,205 @@ describe('CompletionCheckCommandPlugin', () => {
 
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
       expect(mockInput.client.tui.showToast).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('per-session directory isolation', () => {
+    it('should load different commands for two concurrent sessions in different directories', async () => {
+      const parentDir = await fs.mkdtemp('/tmp/ccc-parent-')
+      const childDir = await fs.mkdtemp('/tmp/ccc-child-')
+      const mockInput = createMockInput()
+      mockFsFiles([
+        [parentDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('echo parent-check')],
+        [childDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('echo child-check')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-parent',
+              directory: parentDir,
+              projectID: 'test-project',
+              title: 'Parent',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-child',
+              directory: childDir,
+              projectID: 'test-project',
+              title: 'Child',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      // Both sessions loaded their own command from their own AGENTS.md.
+      expect(fs.readFile).toHaveBeenCalledWith(parentDir + '/AGENTS.md', 'utf-8')
+      expect(fs.readFile).toHaveBeenCalledWith(childDir + '/AGENTS.md', 'utf-8')
+
+      // Both sessions idle and run their own (succeeding) command, so no re-prompt.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-parent' } },
+      })
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-child' } },
+      })
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+
+      vi.restoreAllMocks()
+    })
+
+    it('should keep parent and child sessions isolated with their own commands', async () => {
+      const parentDir = await fs.mkdtemp('/tmp/ccc-parent-')
+      const childDir = await fs.mkdtemp('/tmp/ccc-child-')
+      const mockInput = createMockInput()
+      mockFsFiles([
+        [parentDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('echo parent-check')],
+        [childDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('echo child-check')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-parent',
+              directory: parentDir,
+              projectID: 'test-project',
+              title: 'Parent',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-child',
+              directory: childDir,
+              projectID: 'test-project',
+              title: 'Child',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      // Parent idles and runs its own (succeeding) command.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-parent' } },
+      })
+
+      // Child idles and runs its own (succeeding) command.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-child' } },
+      })
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+
+      vi.restoreAllMocks()
+    })
+
+    it('should run the command in the session directory, not the global input.directory', async () => {
+      const sessionDir = await fs.mkdtemp('/tmp/ccc-session-')
+      const mockInput = createMockInput({ directory: '/global' })
+      mockFsFiles([[sessionDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND)]])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-dir',
+              directory: sessionDir,
+              projectID: 'test-project',
+              title: 'Test',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-dir' } },
+      })
+
+      // The failing command ran in the session directory and re-prompted.
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+
+      vi.restoreAllMocks()
+    })
+
+    it('should isolate retries and promptAsync per sessionID', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any, { maxRetries: 1 })
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-a',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-b',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      // Exhaust retries on session-a.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-a' } },
+      })
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-a' } },
+      })
+
+      // session-b is unaffected and still re-prompts.
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-b' } },
+      })
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(2)
+      const sessionACalls = mockInput.client.session.promptAsync.mock.calls.filter(
+        (c: any[]) => c[0].path.id === 'session-a',
+      )
+      const sessionBCalls = mockInput.client.session.promptAsync.mock.calls.filter(
+        (c: any[]) => c[0].path.id === 'session-b',
+      )
+      expect(sessionACalls).toHaveLength(1)
+      expect(sessionBCalls).toHaveLength(1)
     })
   })
 })
