@@ -1149,6 +1149,8 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
 
       vi.restoreAllMocks()
+      await fs.rm(parentDir, { recursive: true, force: true })
+      await fs.rm(childDir, { recursive: true, force: true })
     })
 
     it('should keep parent and child sessions isolated with their own commands', async () => {
@@ -1207,12 +1209,18 @@ describe('CompletionCheckCommandPlugin', () => {
       expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
 
       vi.restoreAllMocks()
+      await fs.rm(parentDir, { recursive: true, force: true })
+      await fs.rm(childDir, { recursive: true, force: true })
     })
 
     it('should run the command in the session directory, not the global input.directory', async () => {
       const sessionDir = await fs.mkdtemp('/tmp/ccc-session-')
+      // Create a marker file only in the session directory.
+      await fs.writeFile(sessionDir + '/.marker', 'ok')
       const mockInput = createMockInput({ directory: '/global' })
-      mockFsFiles([[sessionDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND)]])
+      mockFsFiles([
+        [sessionDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('test -f .marker')],
+      ])
 
       const hooks = await CompletionCheckCommandPlugin(mockInput as any)
 
@@ -1236,10 +1244,66 @@ describe('CompletionCheckCommandPlugin', () => {
         event: { type: 'session.idle', properties: { sessionID: 'session-dir' } },
       })
 
-      // The failing command ran in the session directory and re-prompted.
-      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      // `test -f .marker` succeeds only in sessionDir (where .marker exists).
+      // If it ran in the global directory (/global), it would fail and
+      // promptAsync would be called.
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
 
       vi.restoreAllMocks()
+      await fs.rm(sessionDir, { recursive: true, force: true })
+    })
+
+    it('should preserve the stored directory when command.execute.before overrides the command', async () => {
+      const sessionDir = await fs.mkdtemp('/tmp/ccc-preserve-')
+      // Create a marker file only in the session directory.
+      await fs.writeFile(sessionDir + '/.marker', 'ok')
+      const mockInput = createMockInput()
+      mockFsFiles([
+        [sessionDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('echo original-check')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      // Session created: stores command from AGENTS.md + the session directory.
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-preserve',
+              directory: sessionDir,
+              projectID: 'test-project',
+              title: 'Test',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      // Override the command via command.execute.before — this must update the
+      // command but preserve the stored directory (not reset it to undefined).
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-preserve',
+          arguments: codeBlock('test -f .marker'),
+        },
+        { parts },
+      )
+
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-preserve' } },
+      })
+
+      // `test -f .marker` succeeds only in sessionDir (where .marker exists).
+      // If the directory were lost, the command would run in the global
+      // directory (process.cwd()), fail, and promptAsync would be called.
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+
+      vi.restoreAllMocks()
+      await fs.rm(sessionDir, { recursive: true, force: true })
     })
 
     it('should isolate retries and promptAsync per sessionID', async () => {

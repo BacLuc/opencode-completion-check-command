@@ -299,6 +299,12 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
     },
 
     event: async ({ event }) => {
+      // Note: the SDK exposes `parentID?: string` on `Session` (types.gen.d.ts:469),
+      // but we deliberately do NOT inherit the parent's completion-check command.
+      // Each session resolves its own command from its own directory via
+      // readDefaultCommand(directory). This ensures a child repository checked out
+      // by a subagent uses the AGENTS.md/dotfile command from its own working
+      // directory, not the parent's.
       if (event.type === 'session.created') {
         const sessionID = (event as Extract<Event, { type: 'session.created' }>).properties.info.id
         const directory = (event as Extract<Event, { type: 'session.created' }>).properties.info.directory
