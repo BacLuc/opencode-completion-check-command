@@ -16,6 +16,7 @@ export function parseCodeBlock(input: string): string | null {
 
 interface SessionEntry {
   command: string
+  directory: string
   retries: number
 }
 
@@ -27,12 +28,16 @@ export class CompletionCheckStore {
     this.maxRetries = maxRetries
   }
 
-  set(sessionID: string, command: string): void {
-    this.entries.set(sessionID, { command, retries: 0 })
+  set(sessionID: string, command: string, directory: string = ''): void {
+    this.entries.set(sessionID, { command, directory, retries: 0 })
   }
 
   get(sessionID: string): string | undefined {
     return this.entries.get(sessionID)?.command
+  }
+
+  getDirectory(sessionID: string): string | undefined {
+    return this.entries.get(sessionID)?.directory
   }
 
   getEntry(sessionID: string): SessionEntry | undefined {
@@ -277,7 +282,7 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
         return
       }
 
-      store.set(input.sessionID, command)
+      store.set(input.sessionID, command, store.getDirectory(input.sessionID))
 
       try {
         await client.tui.showToast({
@@ -294,13 +299,19 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
     },
 
     event: async ({ event }) => {
+      // Note: the SDK exposes `parentID?: string` on `Session` (types.gen.d.ts:469),
+      // but we deliberately do NOT inherit the parent's completion-check command.
+      // Each session resolves its own command from its own directory via
+      // readDefaultCommand(directory). This ensures a child repository checked out
+      // by a subagent uses the AGENTS.md/dotfile command from its own working
+      // directory, not the parent's.
       if (event.type === 'session.created') {
         const sessionID = (event as Extract<Event, { type: 'session.created' }>).properties.info.id
         const directory = (event as Extract<Event, { type: 'session.created' }>).properties.info.directory
         const { command: defaultCommand, source } = await readDefaultCommand(directory)
 
         if (defaultCommand && source) {
-          store.set(sessionID, defaultCommand)
+          store.set(sessionID, defaultCommand, directory)
 
           try {
             await client.tui.showToast({
@@ -355,7 +366,8 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
           return
         }
 
-        const result = await executeCommand(command, input.directory)
+        const sessionDirectory = store.getDirectory(sessionID) || input.directory
+        const result = await executeCommand(command, sessionDirectory)
 
         if (result.exitCode === 0) {
           store.delete(sessionID)
