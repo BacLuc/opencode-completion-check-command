@@ -5,7 +5,7 @@ An [opencode](https://opencode.ai) plugin that automatically verifies task compl
 ## How It Works
 
 1. Use the `/completion-check-command` slash command in your opencode prompt followed by a markdown code block containing the shell command to run
-2. When the agent finishes (session goes idle), the plugin executes the stored command
+2. When the agent finishes a turn (an assistant message completes with `finish: "stop"`), the plugin executes the stored command — this fires before the session goes idle, so a failing check can re-prompt the agent while the run loop is still active
 3. If the command exits with code 0, the task is considered complete
 4. If the command exits with a non-zero code, the agent is automatically prompted again with:
 
