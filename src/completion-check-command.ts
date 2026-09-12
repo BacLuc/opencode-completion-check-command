@@ -299,6 +299,7 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
 
       if (result.exitCode === 0) {
         store.delete(sessionID)
+        lastCheckedMessageID.delete(sessionID)
 
         console.log(`[Completion Check] Command succeeded. Task is complete.\nCommand: ${command}`)
 
