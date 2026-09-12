@@ -374,11 +374,11 @@ describe('isUsageLimitError', () => {
 
 // Builds a messages response as returned by client.session.messages, ending in
 // an assistant message carrying the given error (or none).
-function messagesWithAssistantError(error?: unknown) {
+function messagesWithAssistantError(error?: unknown, id = 'msg-assistant') {
   return {
     data: [
       { info: { role: 'user', id: 'msg-user' }, parts: [] },
-      { info: { role: 'assistant', id: 'msg-assistant', error }, parts: [] },
+      { info: { role: 'assistant', id, error }, parts: [] },
     ],
   }
 }
@@ -963,6 +963,295 @@ describe('CompletionCheckCommandPlugin', () => {
       })
 
       // Unrelated error -> normal behaviour: failing command re-prompts the agent.
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('message.updated handling', () => {
+    function messageUpdatedEvent(info: Record<string, unknown>): any {
+      return {
+        event: {
+          type: 'message.updated',
+          properties: { info },
+        },
+      }
+    }
+
+    function assistantInfo(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'msg-assistant',
+        role: 'assistant',
+        sessionID: 'session-mu',
+        finish: 'stop',
+        ...overrides,
+      }
+    }
+
+    it('runs the check and re-prompts when an assistant message finishes with stop and the command fails', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!(messageUpdatedEvent(assistantInfo()))
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+      const failureCall = mockInput.client.session.promptAsync.mock.calls[0][0]
+      expect(failureCall.path.id).toBe('session-mu')
+      expect(failureCall.body.parts[0].text).toContain('you are not yet finished:')
+    })
+
+    it('does not run the check for assistant messages with finish tool-calls', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!(messageUpdatedEvent(assistantInfo({ finish: 'tool-calls' })))
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+    })
+
+    it('does not run the check for user messages', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!(
+        messageUpdatedEvent({ id: 'msg-user', role: 'user', sessionID: 'session-mu', finish: 'stop' }),
+      )
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+    })
+
+    it('does not run the check twice for duplicate message.updated events of the same assistant message', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!(messageUpdatedEvent(assistantInfo()))
+      await hooks['event']!(messageUpdatedEvent(assistantInfo()))
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not run the check when no command is registered for the session', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!(messageUpdatedEvent(assistantInfo()))
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+    })
+
+    it('skips the check and does not re-prompt when the usage limit was reached', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!(
+        messageUpdatedEvent(
+          assistantInfo({ error: { name: 'APIError', data: { statusCode: 429, message: 'Too Many Requests' } } }),
+        ),
+      )
+
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+      const toastMessages = mockInput.client.tui.showToast.mock.calls.map((c: any[]) => c[0].body.message)
+      expect(toastMessages.some((m: string) => m.toLowerCase().includes('usage limit'))).toBe(true)
+    })
+
+    it('runs the check in the session directory from message.updated', async () => {
+      const sessionDir = await fs.mkdtemp('/tmp/ccc-mu-dir-')
+      await fs.writeFile(sessionDir + '/.marker', 'ok')
+      const mockInput = createMockInput({ directory: '/global' })
+      mockFsFiles([
+        [sessionDir + '/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('test -f .marker')],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-mu-dir',
+              directory: sessionDir,
+              projectID: 'test-project',
+              title: 'Test',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!(
+        messageUpdatedEvent({ id: 'msg-mu-dir', role: 'assistant', sessionID: 'session-mu-dir', finish: 'stop' }),
+      )
+
+      // `test -f .marker` succeeds only in sessionDir (where .marker exists).
+      // If it ran in the global directory (/global), it would fail and
+      // promptAsync would be called.
+      expect(mockInput.client.session.promptAsync).not.toHaveBeenCalled()
+
+      vi.restoreAllMocks()
+      await fs.rm(sessionDir, { recursive: true, force: true })
+    })
+
+    it('runs the check for a default command loaded from AGENTS.md on session.created, then message.updated finish=stop', async () => {
+      const mockInput = createMockInput()
+      mockFsFiles([
+        [`${process.cwd()}/AGENTS.md`, '# AGENTS.md\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND)],
+      ])
+
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      await hooks['event']!({
+        event: {
+          type: 'session.created',
+          properties: {
+            info: {
+              id: 'session-mu-default',
+              directory: process.cwd(),
+              projectID: 'test-project',
+              title: 'Test Session',
+              version: '1',
+              time: { created: Date.now(), updated: Date.now() },
+            },
+          },
+        },
+      })
+
+      await hooks['event']!(
+        messageUpdatedEvent({
+          id: 'msg-mu-default',
+          role: 'assistant',
+          sessionID: 'session-mu-default',
+          finish: 'stop',
+        }),
+      )
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+
+      vi.restoreAllMocks()
+    })
+
+    it('does not run the check again on session.idle when message.updated already handled the turn', async () => {
+      const mockInput = createMockInput()
+      mockInput.client.session.messages.mockResolvedValue(messagesWithAssistantError(undefined, 'msg-mu-handled'))
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!(messageUpdatedEvent(assistantInfo({ id: 'msg-mu-handled' })))
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-mu' } },
+      })
+
+      // The message.updated branch already handled this turn, so session.idle
+      // must not run the check a second time.
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+    })
+
+    it('still runs the check on session.idle when the last assistant message was not handled by message.updated', async () => {
+      const mockInput = createMockInput()
+      mockInput.client.session.messages.mockResolvedValue(messagesWithAssistantError(undefined, 'msg-not-handled'))
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any)
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-mu' } },
+      })
+
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+    })
+
+    it('respects maxRetries across message.updated and session.idle', async () => {
+      const mockInput = createMockInput()
+      const hooks = await CompletionCheckCommandPlugin(mockInput as any, { maxRetries: 1 })
+
+      const parts: any[] = []
+      await hooks['command.execute.before']!(
+        {
+          command: 'completion-check-command',
+          sessionID: 'session-mu',
+          arguments: codeBlock(FAIL_COMMAND),
+        },
+        { parts },
+      )
+
+      // First turn handled by message.updated: check fails, retries=1, re-prompt.
+      await hooks['event']!(messageUpdatedEvent(assistantInfo({ id: 'msg-1' })))
+      expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
+
+      // Second turn: session.idle with a different last assistant message. The
+      // check runs again but the retry budget is exhausted, so no re-prompt.
+      mockInput.client.session.messages.mockResolvedValue(messagesWithAssistantError(undefined, 'msg-2'))
+      await hooks['event']!({
+        event: { type: 'session.idle', properties: { sessionID: 'session-mu' } },
+      })
+
       expect(mockInput.client.session.promptAsync).toHaveBeenCalledTimes(1)
     })
   })
