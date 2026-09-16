@@ -36,7 +36,7 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.18.25"
+    "@opencode-ai/plugin": "1.18.26"
   },
   "devDependencies": {
     "@types/bun": "1.4.0",
