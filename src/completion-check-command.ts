@@ -1,6 +1,7 @@
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
 import type { Event } from '@opencode-ai/sdk'
 import { promises as fs } from 'fs'
+import { homedir } from 'os'
 import { exec } from 'child_process'
 
 export const DEFAULT_MAX_RETRIES = 10
@@ -212,6 +213,74 @@ async function readDefaultCommandFromDotfile(filePath: string): Promise<string |
   return trimmed || null
 }
 
+function extractStopCommands(parsed: unknown): string | null {
+  if (!parsed || typeof parsed !== 'object') {
+    return null
+  }
+  const hooks = (parsed as { hooks?: unknown }).hooks
+  if (!hooks || typeof hooks !== 'object') {
+    return null
+  }
+  const stop = (hooks as { Stop?: unknown }).Stop
+  if (!Array.isArray(stop)) {
+    return null
+  }
+  const commands: string[] = []
+  for (const entry of stop) {
+    if (!entry || typeof entry !== 'object') {
+      continue
+    }
+    const entryHooks = (entry as { hooks?: unknown }).hooks
+    if (!Array.isArray(entryHooks)) {
+      continue
+    }
+    for (const hook of entryHooks) {
+      if (!hook || typeof hook !== 'object') {
+        continue
+      }
+      const typed = hook as { type?: unknown; command?: unknown }
+      if (typed.type !== 'command' || typeof typed.command !== 'string' || !typed.command.trim()) {
+        continue
+      }
+      commands.push(typed.command.trim())
+    }
+  }
+  if (commands.length === 0) {
+    return null
+  }
+  return commands.join(' && ')
+}
+
+async function readStopCommandsFile(filePath: string): Promise<string | null> {
+  const content = await readFileIfExists(filePath)
+  if (!content) {
+    return null
+  }
+  try {
+    return extractStopCommands(JSON.parse(content))
+  } catch {
+    return null
+  }
+}
+
+export async function readDefaultCommandFromClaudeHooks(
+  directory: string,
+): Promise<{ command: string | null; source: string | null }> {
+  const home = process.env.HOME || homedir()
+  const candidates: Array<[string, string]> = [
+    [`${directory}/.claude/settings.local.json`, '.claude/settings.local.json'],
+    [`${directory}/.claude/settings.json`, '.claude/settings.json'],
+    [`${home}/.claude/settings.json`, '~/.claude/settings.json'],
+  ]
+  for (const [filePath, source] of candidates) {
+    const command = await readStopCommandsFile(filePath)
+    if (command) {
+      return { command, source }
+    }
+  }
+  return { command: null, source: null }
+}
+
 export async function readDefaultCommand(
   directory: string,
 ): Promise<{ command: string | null; source: string | null }> {
@@ -227,6 +296,11 @@ export async function readDefaultCommand(
   command = await readDefaultCommandFromDotfile(opencodeDotfile)
   if (command) {
     return { command, source: '.opencode/.completion-check-command' }
+  }
+
+  const claudeHooks = await readDefaultCommandFromClaudeHooks(directory)
+  if (claudeHooks.command && claudeHooks.source) {
+    return claudeHooks
   }
 
   command = await readDefaultCommandFromAgentsMd(directory)

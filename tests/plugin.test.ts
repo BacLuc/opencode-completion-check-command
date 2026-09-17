@@ -9,6 +9,7 @@ import {
   parseCodeBlock,
   readDefaultCommandFromAgentsMd,
   readDefaultCommand,
+  readDefaultCommandFromClaudeHooks,
 } from '../src/completion-check-command.js'
 
 describe('parseCodeBlock', () => {
@@ -138,6 +139,166 @@ describe('readDefaultCommand', () => {
     const result = await readDefaultCommand('/test/dir')
     expect(result.command).toBe('./agents-check.sh')
     expect(result.source).toBe('.agents/.completion-check-command')
+  })
+
+  it('prefers dotfiles over claude hooks', async () => {
+    mockFsFiles([
+      ['/test/dir/.opencode/.completion-check-command', './dotfile-check.sh'],
+      [
+        '/test/dir/.claude/settings.json',
+        JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: './hooks-check.sh' }] }] } }),
+      ],
+      ['/test/dir/AGENTS.md', new Error('ENOENT')],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('./dotfile-check.sh')
+    expect(result.source).toBe('.opencode/.completion-check-command')
+  })
+
+  it('prefers claude hooks over AGENTS.md', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.opencode/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.claude/settings.local.json', new Error('ENOENT')],
+      [
+        '/test/dir/.claude/settings.json',
+        JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: './hooks-check.sh' }] }] } }),
+      ],
+      ['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n```bash\n./md-check.sh\n```'],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('./hooks-check.sh')
+    expect(result.source).toBe('.claude/settings.json')
+  })
+})
+
+function claudeSettings(commands: Array<{ type: string; command?: string }>): string {
+  return JSON.stringify({ hooks: { Stop: [{ hooks: commands }] } })
+}
+
+describe('readDefaultCommandFromClaudeHooks', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  it('returns a single Stop command', async () => {
+    mockFsFiles([
+      ['/test/dir/.claude/settings.json', claudeSettings([{ type: 'command', command: './scripts/completion-check' }])],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBe('./scripts/completion-check')
+    expect(result.source).toBe('.claude/settings.json')
+  })
+
+  it('joins multiple Stop commands with &&', async () => {
+    mockFsFiles([
+      [
+        '/test/dir/.claude/settings.json',
+        claudeSettings([
+          { type: 'command', command: './scripts/completion-check' },
+          { type: 'command', command: 'npm test' },
+        ]),
+      ],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBe('./scripts/completion-check && npm test')
+    expect(result.source).toBe('.claude/settings.json')
+  })
+
+  it('prefers settings.local.json over settings.json', async () => {
+    mockFsFiles([
+      ['/test/dir/.claude/settings.local.json', claudeSettings([{ type: 'command', command: './local-check.sh' }])],
+      ['/test/dir/.claude/settings.json', claudeSettings([{ type: 'command', command: './project-check.sh' }])],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBe('./local-check.sh')
+    expect(result.source).toBe('.claude/settings.local.json')
+  })
+
+  it('falls back to settings.json when local has no commands', async () => {
+    mockFsFiles([
+      ['/test/dir/.claude/settings.local.json', new Error('ENOENT')],
+      ['/test/dir/.claude/settings.json', claudeSettings([{ type: 'command', command: './project-check.sh' }])],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBe('./project-check.sh')
+    expect(result.source).toBe('.claude/settings.json')
+  })
+
+  it('falls back to $HOME/.claude/settings.json when project files are missing', async () => {
+    const originalHome = process.env.HOME
+    process.env.HOME = '/test/home'
+    try {
+      mockFsFiles([
+        ['/test/dir/.claude/settings.local.json', new Error('ENOENT')],
+        ['/test/dir/.claude/settings.json', new Error('ENOENT')],
+        ['/test/home/.claude/settings.json', claudeSettings([{ type: 'command', command: './home-check.sh' }])],
+      ])
+      const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+      expect(result.command).toBe('./home-check.sh')
+      expect(result.source).toBe('~/.claude/settings.json')
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = originalHome
+      }
+    }
+  })
+
+  it('returns null when all files are missing', async () => {
+    mockFsFiles([
+      ['/test/dir/.claude/settings.local.json', new Error('ENOENT')],
+      ['/test/dir/.claude/settings.json', new Error('ENOENT')],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBeNull()
+    expect(result.source).toBeNull()
+  })
+
+  it('returns null for malformed JSON', async () => {
+    mockFsFiles([['/test/dir/.claude/settings.json', 'not json {{{']])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBeNull()
+    expect(result.source).toBeNull()
+  })
+
+  it('ignores non-command hooks', async () => {
+    mockFsFiles([
+      [
+        '/test/dir/.claude/settings.json',
+        JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'prompt', prompt: 'are you done?' }] }] } }),
+      ],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBeNull()
+    expect(result.source).toBeNull()
+  })
+
+  it('collects only command hooks when mixed with other types', async () => {
+    mockFsFiles([
+      [
+        '/test/dir/.claude/settings.json',
+        claudeSettings([{ type: 'prompt' }, { type: 'command', command: './scripts/completion-check' }]),
+      ],
+    ])
+    const result = await readDefaultCommandFromClaudeHooks('/test/dir')
+    expect(result.command).toBe('./scripts/completion-check')
+    expect(result.source).toBe('.claude/settings.json')
+  })
+
+  it('returns null when Stop is missing or empty', async () => {
+    mockFsFiles([
+      ['/a/.claude/settings.local.json', new Error('ENOENT')],
+      ['/a/.claude/settings.json', JSON.stringify({ hooks: {} })],
+    ])
+    expect((await readDefaultCommandFromClaudeHooks('/a')).command).toBeNull()
+    vi.resetAllMocks()
+    mockFsFiles([
+      ['/b/.claude/settings.local.json', new Error('ENOENT')],
+      ['/b/.claude/settings.json', JSON.stringify({ permissions: { allow: ['Bash(*)'] } })],
+    ])
+    expect((await readDefaultCommandFromClaudeHooks('/b')).command).toBeNull()
   })
 })
 

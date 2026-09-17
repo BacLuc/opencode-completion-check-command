@@ -8,5 +8,6 @@ export {
   isUsageLimitError,
   sessionHitUsageLimit,
   readDefaultCommand,
+  readDefaultCommandFromClaudeHooks,
 } from './completion-check-command.js'
 export type { CommandResult } from './completion-check-command.js'
