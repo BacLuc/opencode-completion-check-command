@@ -1,5 +1,5 @@
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
-import type { Event } from '@opencode-ai/sdk'
+import type { AssistantMessage, Event } from '@opencode-ai/sdk'
 import { promises as fs } from 'fs'
 import { exec } from 'child_process'
 
@@ -159,27 +159,38 @@ export function isUsageLimitError(error: unknown): boolean {
 }
 
 /**
- * Returns true when the session's most recent assistant message ended with a
- * usage-limit error, i.e. the model ran out of usage rather than finishing.
+ * Returns the most recent assistant message of a session, or undefined when
+ * there is none (or the session cannot be read).
  */
-export async function sessionHitUsageLimit(client: PluginInput['client'], sessionID: string): Promise<boolean> {
+export async function getLastAssistantMessage(
+  client: PluginInput['client'],
+  sessionID: string,
+): Promise<AssistantMessage | undefined> {
   try {
     const response = await client.session.messages({ path: { id: sessionID } })
     const messages = response?.data
     if (!Array.isArray(messages)) {
-      return false
+      return undefined
     }
     for (let i = messages.length - 1; i >= 0; i--) {
       const info = messages[i]?.info
       if (info?.role === 'assistant') {
-        return isUsageLimitError(info.error)
+        return info
       }
     }
-    return false
+    return undefined
   } catch {
-    // If we cannot determine the state, fall back to the normal behaviour.
-    return false
+    return undefined
   }
+}
+
+/**
+ * Returns true when the session's most recent assistant message ended with a
+ * usage-limit error, i.e. the model ran out of usage rather than finishing.
+ */
+export async function sessionHitUsageLimit(client: PluginInput['client'], sessionID: string): Promise<boolean> {
+  const lastAssistantMessage = await getLastAssistantMessage(client, sessionID)
+  return lastAssistantMessage ? isUsageLimitError(lastAssistantMessage.error) : false
 }
 
 export async function readDefaultCommandFromAgentsMd(directory: string): Promise<string | null> {
@@ -243,6 +254,95 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
   const store = new CompletionCheckStore(maxRetries)
 
   const processing = new Set<string>()
+  // Tracks the assistant message ID whose finish=stop was already handled by the
+  // message.updated branch, so duplicate message.updated events and the
+  // session.idle fallback do not run the check twice for the same turn.
+  const lastCheckedMessageID = new Map<string, string>()
+
+  async function runCompletionCheck(sessionID: string, lastAssistantMessage?: AssistantMessage): Promise<void> {
+    const command = store.get(sessionID)
+    if (!command) {
+      return
+    }
+
+    if (processing.has(sessionID)) {
+      return
+    }
+    processing.add(sessionID)
+
+    try {
+      const hitUsageLimit = lastAssistantMessage
+        ? isUsageLimitError(lastAssistantMessage.error)
+        : await sessionHitUsageLimit(client, sessionID)
+      if (hitUsageLimit) {
+        // The agent was cut off by the provider's usage limit rather than
+        // finishing. Skip the completion check (and the re-prompt) so we don't
+        // immediately hit the limit again. The command stays registered, so the
+        // check still runs once the session is able to continue.
+        try {
+          await client.tui.showToast({
+            body: {
+              title: 'Completion Check',
+              message: 'Skipped the completion check because the usage limit was reached.',
+              variant: 'warning',
+              duration: 10000,
+            },
+          })
+        } catch {
+          // Ignore feedback errors
+        }
+        return
+      }
+
+      const sessionDirectory = store.getDirectory(sessionID) || input.directory
+      const result = await executeCommand(command, sessionDirectory)
+
+      if (result.exitCode === 0) {
+        store.delete(sessionID)
+        lastCheckedMessageID.delete(sessionID)
+
+        console.log(`[Completion Check] Command succeeded. Task is complete.\nCommand: ${command}`)
+
+        try {
+          await client.tui.showToast({
+            body: {
+              title: 'Completion Check',
+              message: `Command succeeded! Task is complete.\n\n\`\`\`bash\n${command}\n\`\`\``,
+              variant: 'success',
+              duration: 10000,
+            },
+          })
+        } catch {
+          // Ignore feedback errors
+        }
+
+        return
+      }
+
+      if (store.retriesExhausted(sessionID)) {
+        store.delete(sessionID)
+        return
+      }
+
+      store.incrementRetries(sessionID)
+
+      const failureMessage = buildFailureMessage(result)
+
+      await client.session.promptAsync({
+        path: { id: sessionID },
+        body: {
+          parts: [
+            {
+              type: 'text',
+              text: failureMessage,
+            },
+          ],
+        },
+      })
+    } finally {
+      processing.delete(sessionID)
+    }
+  }
 
   const hooks: Hooks = {
     config: async (config) => {
@@ -330,89 +430,37 @@ export const CompletionCheckCommandPlugin: Plugin = async (input, options) => {
         return
       }
 
+      if (event.type === 'message.updated') {
+        const info = (event as Extract<Event, { type: 'message.updated' }>).properties.info
+        if (info.role !== 'assistant' || info.finish !== 'stop') {
+          return
+        }
+        const sessionID = info.sessionID
+        if (!store.has(sessionID)) {
+          return
+        }
+        if (lastCheckedMessageID.get(sessionID) === info.id) {
+          return
+        }
+        lastCheckedMessageID.set(sessionID, info.id)
+        await runCompletionCheck(sessionID, info)
+        return
+      }
+
       if (event.type !== 'session.idle') {
         return
       }
 
       const sessionID = (event as Extract<Event, { type: 'session.idle' }>).properties.sessionID
-      const command = store.get(sessionID)
-      if (!command) {
+      if (!store.has(sessionID)) {
         return
       }
-
-      if (processing.has(sessionID)) {
+      const lastAssistantMessage = await getLastAssistantMessage(client, sessionID)
+      if (lastAssistantMessage && lastCheckedMessageID.get(sessionID) === lastAssistantMessage.id) {
+        // This turn was already handled by the message.updated branch.
         return
       }
-      processing.add(sessionID)
-
-      try {
-        if (await sessionHitUsageLimit(client, sessionID)) {
-          // The agent was cut off by the provider's usage limit rather than
-          // finishing. Skip the completion check (and the re-prompt) so we don't
-          // immediately hit the limit again. The command stays registered, so the
-          // check still runs once the session is able to continue.
-          try {
-            await client.tui.showToast({
-              body: {
-                title: 'Completion Check',
-                message: 'Skipped the completion check because the usage limit was reached.',
-                variant: 'warning',
-                duration: 10000,
-              },
-            })
-          } catch {
-            // Ignore feedback errors
-          }
-          return
-        }
-
-        const sessionDirectory = store.getDirectory(sessionID) || input.directory
-        const result = await executeCommand(command, sessionDirectory)
-
-        if (result.exitCode === 0) {
-          store.delete(sessionID)
-
-          console.log(`[Completion Check] Command succeeded. Task is complete.\nCommand: ${command}`)
-
-          try {
-            await client.tui.showToast({
-              body: {
-                title: 'Completion Check',
-                message: `Command succeeded! Task is complete.\n\n\`\`\`bash\n${command}\n\`\`\``,
-                variant: 'success',
-                duration: 10000,
-              },
-            })
-          } catch {
-            // Ignore feedback errors
-          }
-
-          return
-        }
-
-        if (store.retriesExhausted(sessionID)) {
-          store.delete(sessionID)
-          return
-        }
-
-        store.incrementRetries(sessionID)
-
-        const failureMessage = buildFailureMessage(result)
-
-        await client.session.promptAsync({
-          path: { id: sessionID },
-          body: {
-            parts: [
-              {
-                type: 'text',
-                text: failureMessage,
-              },
-            ],
-          },
-        })
-      } finally {
-        processing.delete(sessionID)
-      }
+      await runCompletionCheck(sessionID, lastAssistantMessage)
     },
   }
 
