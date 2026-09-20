@@ -67,7 +67,7 @@ The `/completion-check-command` is automatically registered by the plugin's `con
 
 On `session.created` the plugin resolves the default command in precedence order:
 
-1. `.agents/.completion-check-command` 2. `.opencode/.completion-check-command` 3. Claude hooks: `.claude/settings.local.json` → `.claude/settings.json` → `~/.claude/settings.json` (`hooks.Stop[].hooks[]` with `type == "command"` joined with `&&`) 4. `AGENTS.md` code block after `/completion-check-command`
+1. `.agents/.completion-check-command` 2. `.opencode/.completion-check-command` 3. `AGENTS.md` code block after `/completion-check-command` 4. Claude hooks: `.claude/settings.local.json` → `.claude/settings.json` → `~/.claude/settings.json` (`hooks.Stop[].hooks[]` with `type == "command"` joined with `&&`)
 
 Example `settings.json`:
 
