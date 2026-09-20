@@ -155,7 +155,7 @@ describe('readDefaultCommand', () => {
     expect(result.source).toBe('.opencode/.completion-check-command')
   })
 
-  it('prefers claude hooks over AGENTS.md', async () => {
+  it('prefers AGENTS.md over claude hooks', async () => {
     mockFsFiles([
       ['/test/dir/.agents/.completion-check-command', new Error('ENOENT')],
       ['/test/dir/.opencode/.completion-check-command', new Error('ENOENT')],
@@ -165,6 +165,22 @@ describe('readDefaultCommand', () => {
         JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: './hooks-check.sh' }] }] } }),
       ],
       ['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n```bash\n./md-check.sh\n```'],
+    ])
+    const result = await readDefaultCommand('/test/dir')
+    expect(result.command).toBe('./md-check.sh')
+    expect(result.source).toBe('AGENTS.md')
+  })
+
+  it('falls back to claude hooks when AGENTS.md is missing', async () => {
+    mockFsFiles([
+      ['/test/dir/.agents/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.opencode/.completion-check-command', new Error('ENOENT')],
+      ['/test/dir/.claude/settings.local.json', new Error('ENOENT')],
+      [
+        '/test/dir/.claude/settings.json',
+        JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: './hooks-check.sh' }] }] } }),
+      ],
+      ['/test/dir/AGENTS.md', new Error('ENOENT')],
     ])
     const result = await readDefaultCommand('/test/dir')
     expect(result.command).toBe('./hooks-check.sh')

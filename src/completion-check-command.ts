@@ -298,14 +298,14 @@ export async function readDefaultCommand(
     return { command, source: '.opencode/.completion-check-command' }
   }
 
-  const claudeHooks = await readDefaultCommandFromClaudeHooks(directory)
-  if (claudeHooks.command && claudeHooks.source) {
-    return claudeHooks
-  }
-
   command = await readDefaultCommandFromAgentsMd(directory)
   if (command) {
     return { command, source: 'AGENTS.md' }
+  }
+
+  const claudeHooks = await readDefaultCommandFromClaudeHooks(directory)
+  if (claudeHooks.command && claudeHooks.source) {
+    return claudeHooks
   }
 
   return { command: null, source: null }
