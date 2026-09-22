@@ -39,7 +39,7 @@
     "@opencode-ai/plugin": "1.18.29"
   },
   "devDependencies": {
-    "@types/bun": "1.4.1",
+    "@types/bun": "1.4.2",
     "@types/node": "25.9.5",
     "prettier": "3.9.6",
     "typescript": "7.0.2",
