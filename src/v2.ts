@@ -110,11 +110,9 @@ export async function CompletionCheckCommandSetup(ctx: PluginContext): Promise<(
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        try {
-          await handleCompletionCheckEvent({ ctx, store, processing }, event)
-        } catch (error) {
+        void handleCompletionCheckEvent({ ctx, store, processing }, event).catch((error) => {
           console.error('[Completion Check] Failed to handle event', error)
-        }
+        })
       }
     } catch (error) {
       if (!controller.signal.aborted) {
