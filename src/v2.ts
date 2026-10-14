@@ -25,20 +25,36 @@ export interface CompletionCheckRuntime {
   ctx: PluginContext
   store: CompletionCheckStore
   processing: Set<string>
+  resolved: Set<string>
+}
+
+function eventSessionID(event: PluginEvent): string | undefined {
+  const sessionID = (event as { data?: { sessionID?: unknown } }).data?.sessionID
+  return typeof sessionID === 'string' ? sessionID : undefined
+}
+
+function eventDirectory(event: PluginEvent): string | undefined {
+  const location = (event as { location?: { directory?: unknown } }).location
+  if (typeof location?.directory === 'string') return location.directory
+  const dataLocation = (event as { data?: { location?: { directory?: unknown } } }).data?.location
+  return typeof dataLocation?.directory === 'string' ? dataLocation.directory : undefined
 }
 
 export async function handleCompletionCheckEvent(
-  { ctx, store, processing }: CompletionCheckRuntime,
+  { ctx, store, processing, resolved }: CompletionCheckRuntime,
   event: PluginEvent,
 ): Promise<void> {
-  if (event.type === 'session.created') {
-    const { sessionID, location } = event.data
-    const { command: defaultCommand } = await readDefaultCommand(location.directory)
-    if (defaultCommand) {
-      store.set(sessionID, defaultCommand, location.directory)
-      console.log(`[Completion Check] Using default command from ${location.directory}.`)
+  const eventSession = eventSessionID(event)
+  if (eventSession && !resolved.has(eventSession)) {
+    resolved.add(eventSession)
+    if (!store.has(eventSession)) {
+      const directory = eventDirectory(event) ?? ctx.location.directory
+      const { command: defaultCommand } = await readDefaultCommand(directory)
+      if (defaultCommand) {
+        store.set(eventSession, defaultCommand, directory)
+        console.log(`[Completion Check] Using default command from ${directory}.`)
+      }
     }
-    return
   }
 
   const executionEnded =
@@ -46,7 +62,7 @@ export async function handleCompletionCheckEvent(
     event.type === 'session.execution.failed' ||
     event.type === 'session.execution.interrupted'
   if (!executionEnded) return
-  if (event.type === 'session.execution.interrupted' && event.data.reason === 'shutdown') return
+  if (event.type === 'session.execution.interrupted' && event.data.reason !== 'user') return
 
   const sessionID = event.data.sessionID
   const command = store.get(sessionID)
@@ -87,6 +103,7 @@ export async function CompletionCheckCommandSetup(ctx: PluginContext): Promise<(
   const maxRetries = typeof ctx.options?.maxRetries === 'number' ? ctx.options.maxRetries : DEFAULT_MAX_RETRIES
   const store = new CompletionCheckStore(maxRetries)
   const processing = new Set<string>()
+  const resolved = new Set<string>()
 
   await ctx.command.transform((editor) => {
     editor.add({
@@ -110,7 +127,7 @@ export async function CompletionCheckCommandSetup(ctx: PluginContext): Promise<(
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        void handleCompletionCheckEvent({ ctx, store, processing }, event).catch((error) => {
+        void handleCompletionCheckEvent({ ctx, store, processing, resolved }, event).catch((error) => {
           console.error('[Completion Check] Failed to handle event', error)
         })
       }

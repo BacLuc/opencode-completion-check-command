@@ -79,7 +79,7 @@ In V2 the plugin registers the command through the plugin API (`ctx.command.tran
 
 ### Default Command Sources
 
-On `session.created` the plugin resolves the default command in precedence order:
+The plugin resolves the default command once per session, on the first event it receives for that session (not on `session.created`, which is not reliably delivered to plugins on the headless `opencode run` path), in precedence order:
 
 1. `.agents/.completion-check-command` 2. `.opencode/.completion-check-command` 3. `AGENTS.md` code block after `/completion-check-command` 4. Claude hooks: `.claude/settings.local.json` → `.claude/settings.json` → `~/.claude/settings.json` (`hooks.Stop[].hooks[]` with `type == "command"` joined with `&&`)
 
