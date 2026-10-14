@@ -544,6 +544,10 @@ describe('isUsageLimitError', () => {
     ['undefined error', undefined, false],
     ['null error', null, false],
     ['empty object', {}, false],
+    ['V2 429 status', { type: 'api', status: 429, message: 'Too Many Requests' }, true],
+    ['V2 message quota', { type: 'provider', message: 'quota exceeded' }, true],
+    ['V2 response body out of credits', { type: 'api', status: 402, response: { body: 'out of credits' } }, true],
+    ['V2 unrelated 500', { type: 'api', status: 500, message: 'Internal Server Error' }, false],
   ])('should detect %s', (_name, error, expected) => {
     expect(isUsageLimitError(error)).toBe(expected)
   })
