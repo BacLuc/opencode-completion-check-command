@@ -36,9 +36,21 @@ The plugin will extract the command from the code block and run it when the agen
 
 ## Configuration
 
+This plugin supports opencode V1 (>= 1.18.29) and V2.
+
 ### Plugin Options
 
-The plugin accepts an `maxRetries` option (default: `10`) that controls the maximum number of times the agent will be re-prompted when the check command fails:
+The plugin accepts a `maxRetries` option (default: `10`) that controls the maximum number of times the agent will be re-prompted when the check command fails.
+
+V2:
+
+```jsonc
+{
+  "plugins": [{ "package": "bacluc-opencode-completion-check-command@<version>", "options": { "maxRetries": 10 } }],
+}
+```
+
+V1:
 
 ```json
 {
@@ -50,7 +62,22 @@ Setting `maxRetries` to `0` disables re-prompting entirely — the command runs 
 
 ### Custom Command Template
 
-The `/completion-check-command` is automatically registered by the plugin's `config` hook. If you want to override the template, add it to your `opencode.json`:
+The `/completion-check-command` is automatically registered by the plugin. If you want to override the template, add it to your `opencode.json`.
+
+V2 uses `commands` and the `$ARGUMENTS` placeholder:
+
+```jsonc
+{
+  "commands": {
+    "completion-check-command": {
+      "template": "Your custom template here: $ARGUMENTS",
+      "description": "Custom description",
+    },
+  },
+}
+```
+
+V1 uses `command` and the `{{arguments}}` placeholder:
 
 ```json
 {

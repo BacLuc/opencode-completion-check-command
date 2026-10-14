@@ -140,18 +140,31 @@ export function isUsageLimitError(error: unknown): boolean {
   if (!error || typeof error !== 'object') {
     return false
   }
-  const { name, data } = error as { name?: string; data?: Record<string, unknown> }
-  const statusCode = typeof data?.statusCode === 'number' ? data.statusCode : undefined
+  // V1: { name, data: { statusCode, message, responseBody } }
+  // V2: { type, message, status?, response?: { body } }
+  const e = error as {
+    name?: string
+    type?: string
+    status?: number
+    message?: string
+    response?: { body?: string }
+    data?: Record<string, unknown>
+  }
+  const statusCode =
+    typeof e.data?.statusCode === 'number' ? e.data.statusCode : typeof e.status === 'number' ? e.status : undefined
 
   // HTTP 429 from the provider always means rate / usage limit reached.
-  if (name === 'APIError' && statusCode === 429) {
+  if (statusCode === 429) {
     return true
   }
 
-  // Otherwise fall back to matching the human-readable message / response body,
-  // which is how quota/credit exhaustion surfaces across providers.
-  const message = typeof data?.message === 'string' ? data.message : ''
-  const responseBody = typeof data?.responseBody === 'string' ? data.responseBody : ''
+  const message = typeof e.message === 'string' ? e.message : typeof e.data?.message === 'string' ? e.data.message : ''
+  const responseBody =
+    typeof e.response?.body === 'string'
+      ? e.response.body
+      : typeof e.data?.responseBody === 'string'
+        ? e.data.responseBody
+        : ''
   const haystack = `${message} ${responseBody}`.toLowerCase()
 
   return /usage limit|rate limit|quota|too many requests|credit balance|out of credits|insufficient (?:credit|balance|funds|quota)/.test(
