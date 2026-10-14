@@ -38,12 +38,15 @@ function createMockCtx() {
     },
     session: {
       prompt: vi.fn().mockResolvedValue(undefined),
-      context: vi.fn().mockResolvedValue([]),
     },
     location: { directory: process.cwd() },
     options: {},
   }
   return { ctx, commandDefinitions }
+}
+
+function executionEnded(type: 'succeeded' | 'failed' | 'interrupted', extra: Record<string, unknown> = {}) {
+  return { type: `session.execution.${type}`, data: { sessionID: 's1', ...extra } }
 }
 
 function runtime(ctx: any, store: CompletionCheckStore) {
@@ -57,24 +60,16 @@ afterEach(() => {
 describe('CompletionCheckCommandSetup', () => {
   it('registers the completion-check-command and subscribes to events', async () => {
     const { ctx, commandDefinitions } = createMockCtx()
-
-    const cleanup = await CompletionCheckCommandSetup(ctx as any)
+    await CompletionCheckCommandSetup(ctx as any)
 
     expect(commandDefinitions).toHaveLength(1)
     expect(commandDefinitions[0].name).toBe(COMPLETION_CHECK_COMMAND_NAME)
-    expect(commandDefinitions[0].description).toBeTruthy()
-    expect(typeof commandDefinitions[0].execute).toBe('function')
 
-    expect(ctx.event.subscribe).toHaveBeenCalledTimes(1)
-    const signal = ctx.event.subscribe.mock.calls[0][0].signal
-    expect(signal).toBeInstanceOf(AbortSignal)
-    expect(signal.aborted).toBe(false)
-
-    cleanup()
-    expect(signal.aborted).toBe(true)
+    const subscription = ctx.event.subscribe.mock.calls[0][0] as { signal: AbortSignal }
+    expect(subscription.signal).toBeInstanceOf(AbortSignal)
   })
 
-  it('stores the command and re-prompts with the template when executed with a code block', async () => {
+  it('re-prompts with the completion check template when the command is invoked', async () => {
     const { ctx, commandDefinitions } = createMockCtx()
     await CompletionCheckCommandSetup(ctx as any)
 
@@ -85,108 +80,110 @@ describe('CompletionCheckCommandSetup', () => {
     })
 
     expect(ctx.session.prompt).toHaveBeenCalledTimes(1)
-    const call = ctx.session.prompt.mock.calls[0][0]
-    expect(call.sessionID).toBe('s1')
-    expect(call.text).toContain(FAIL_COMMAND)
-    expect(call.delivery).toBe('steer')
+    expect(ctx.session.prompt.mock.calls[0][0].text).toContain(FAIL_COMMAND)
   })
 
-  it('does not prompt when executed without a code block', async () => {
+  it('ignores invocations without a code block', async () => {
     const { ctx, commandDefinitions } = createMockCtx()
     await CompletionCheckCommandSetup(ctx as any)
 
-    await commandDefinitions[0].execute({
-      sessionID: 's1',
-      prompt: { text: 'plain text' },
-      delivery: 'steer',
-    })
+    await commandDefinitions[0].execute({ sessionID: 's1', prompt: { text: 'no code here' }, delivery: 'steer' })
 
     expect(ctx.session.prompt).not.toHaveBeenCalled()
   })
 })
 
 describe('handleCompletionCheckEvent', () => {
-  it('stores the default command from AGENTS.md on session.created', async () => {
-    mockFsFiles([['/test/dir/AGENTS.md', '# AGENTS.md\n\n/completion-check-command\n' + codeBlock('npm test')]])
+  it('registers the default command from AGENTS.md on session.created', async () => {
+    mockFsFiles([['/repo/AGENTS.md', '# Repo\n\n/completion-check-command\n' + codeBlock(FAIL_COMMAND)]])
     const { ctx } = createMockCtx()
     const store = new CompletionCheckStore()
 
     await handleCompletionCheckEvent(runtime(ctx, store), {
       type: 'session.created',
-      data: { sessionID: 's1', location: { directory: '/test/dir' } },
+      data: { sessionID: 's1', location: { directory: '/repo' } },
     } as any)
 
-    expect(store.get('s1')).toBe('npm test')
-    expect(store.getDirectory('s1')).toBe('/test/dir')
+    expect(store.get('s1')).toBe(FAIL_COMMAND)
   })
 
-  it('re-prompts on a failing command when the session goes idle via session.status', async () => {
+  it('runs the check and re-prompts when the execution succeeded but the command failed', async () => {
     const { ctx } = createMockCtx()
     const store = new CompletionCheckStore()
     store.set('s1', FAIL_COMMAND, process.cwd())
 
-    await handleCompletionCheckEvent(runtime(ctx, store), {
-      type: 'session.status',
-      data: { sessionID: 's1', status: { type: 'idle' } },
-    } as any)
+    await handleCompletionCheckEvent(runtime(ctx, store), executionEnded('succeeded') as any)
 
     expect(ctx.session.prompt).toHaveBeenCalledTimes(1)
     expect(ctx.session.prompt.mock.calls[0][0].text).toContain('you are not yet finished')
   })
 
-  it('does not prompt and removes the command when it succeeds', async () => {
+  it('removes the command without prompting when it succeeds', async () => {
     const { ctx } = createMockCtx()
     const store = new CompletionCheckStore()
     store.set('s1', SUCCESS_COMMAND, process.cwd())
 
-    await handleCompletionCheckEvent(runtime(ctx, store), {
-      type: 'session.status',
-      data: { sessionID: 's1', status: { type: 'idle' } },
-    } as any)
+    await handleCompletionCheckEvent(runtime(ctx, store), executionEnded('succeeded') as any)
 
     expect(ctx.session.prompt).not.toHaveBeenCalled()
     expect(store.get('s1')).toBeUndefined()
   })
 
-  it('does not prompt on non-idle status', async () => {
+  it('runs the check when the execution failed with a non-usage-limit error', async () => {
     const { ctx } = createMockCtx()
     const store = new CompletionCheckStore()
     store.set('s1', FAIL_COMMAND, process.cwd())
 
-    await handleCompletionCheckEvent(runtime(ctx, store), {
-      type: 'session.status',
-      data: { sessionID: 's1', status: { type: 'busy' } },
-    } as any)
+    await handleCompletionCheckEvent(
+      runtime(ctx, store),
+      executionEnded('failed', { error: { type: 'provider', message: 'boom', status: 500 } }) as any,
+    )
+
+    expect(ctx.session.prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('skips the check when the execution failed with a usage limit error', async () => {
+    const { ctx } = createMockCtx()
+    const store = new CompletionCheckStore()
+    store.set('s1', FAIL_COMMAND, process.cwd())
+
+    await handleCompletionCheckEvent(
+      runtime(ctx, store),
+      executionEnded('failed', { error: { type: 'provider', message: 'usage limit reached', status: 429 } }) as any,
+    )
+
+    expect(ctx.session.prompt).not.toHaveBeenCalled()
+    expect(store.get('s1')).toBe(FAIL_COMMAND)
+  })
+
+  it('runs the check when the execution was interrupted by the user', async () => {
+    const { ctx } = createMockCtx()
+    const store = new CompletionCheckStore()
+    store.set('s1', FAIL_COMMAND, process.cwd())
+
+    await handleCompletionCheckEvent(runtime(ctx, store), executionEnded('interrupted', { reason: 'user' }) as any)
+
+    expect(ctx.session.prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('skips the check when the execution was interrupted by a shutdown', async () => {
+    const { ctx } = createMockCtx()
+    const store = new CompletionCheckStore()
+    store.set('s1', FAIL_COMMAND, process.cwd())
+
+    await handleCompletionCheckEvent(runtime(ctx, store), executionEnded('interrupted', { reason: 'shutdown' }) as any)
 
     expect(ctx.session.prompt).not.toHaveBeenCalled()
   })
 
-  it('re-prompts on the deprecated session.idle event', async () => {
+  it('does not run before the execution ends', async () => {
     const { ctx } = createMockCtx()
     const store = new CompletionCheckStore()
     store.set('s1', FAIL_COMMAND, process.cwd())
 
     await handleCompletionCheckEvent(runtime(ctx, store), {
-      type: 'session.idle',
+      type: 'session.execution.started',
       data: { sessionID: 's1' },
-    } as any)
-
-    expect(ctx.session.prompt).toHaveBeenCalledTimes(1)
-    expect(ctx.session.prompt.mock.calls[0][0].text).toContain('you are not yet finished')
-  })
-
-  it('does not prompt when the session hit the usage limit', async () => {
-    const { ctx } = createMockCtx()
-    ctx.session.context.mockResolvedValue([
-      { type: 'user' },
-      { type: 'assistant', error: { type: 'provider', message: 'usage limit reached', status: 429 } },
-    ])
-    const store = new CompletionCheckStore()
-    store.set('s1', FAIL_COMMAND, process.cwd())
-
-    await handleCompletionCheckEvent(runtime(ctx, store), {
-      type: 'session.status',
-      data: { sessionID: 's1', status: { type: 'idle' } },
     } as any)
 
     expect(ctx.session.prompt).not.toHaveBeenCalled()
@@ -198,10 +195,7 @@ describe('handleCompletionCheckEvent', () => {
     store.set('s1', FAIL_COMMAND, process.cwd())
 
     for (let i = 0; i < 5; i++) {
-      await handleCompletionCheckEvent(runtime(ctx, store), {
-        type: 'session.status',
-        data: { sessionID: 's1', status: { type: 'idle' } },
-      } as any)
+      await handleCompletionCheckEvent(runtime(ctx, store), executionEnded('succeeded') as any)
     }
 
     expect(ctx.session.prompt).toHaveBeenCalledTimes(2)

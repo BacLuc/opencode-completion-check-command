@@ -62,22 +62,7 @@ Setting `maxRetries` to `0` disables re-prompting entirely — the command runs 
 
 ### Custom Command Template
 
-The `/completion-check-command` is automatically registered by the plugin. If you want to override the template, add it to your `opencode.json`.
-
-V2 uses `commands` and the `$ARGUMENTS` placeholder:
-
-```jsonc
-{
-  "commands": {
-    "completion-check-command": {
-      "template": "Your custom template here: $ARGUMENTS",
-      "description": "Custom description",
-    },
-  },
-}
-```
-
-V1 uses `command` and the `{{arguments}}` placeholder:
+The `/completion-check-command` is automatically registered by the plugin. In V1 the plugin's `config` hook registers it, and an `opencode.json` override replaces the template (the plugin's `command.execute.before` hook still captures the command from the code block). V1 uses `command` and the `{{arguments}}` placeholder:
 
 ```json
 {
@@ -89,6 +74,8 @@ V1 uses `command` and the `{{arguments}}` placeholder:
   }
 }
 ```
+
+In V2 the plugin registers the command through the plugin API (`ctx.command.transform`) and reads the raw arguments itself, so the template cannot be overridden with a `commands` entry: a same-named `commands.completion-check-command` from config replaces the plugin's implementation and breaks command registration.
 
 ### Default Command Sources
 
