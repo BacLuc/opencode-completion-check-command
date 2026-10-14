@@ -27,22 +27,6 @@ export interface CompletionCheckRuntime {
   processing: Set<string>
 }
 
-export async function sessionHitUsageLimitV2(ctx: PluginContext, sessionID: string): Promise<boolean> {
-  try {
-    const messages = await ctx.session.context({ sessionID })
-    if (!Array.isArray(messages)) return false
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const info = messages[i]
-      if (info.type === 'assistant') {
-        return isUsageLimitError(info.error)
-      }
-    }
-    return false
-  } catch {
-    return false
-  }
-}
-
 export async function handleCompletionCheckEvent(
   { ctx, store, processing }: CompletionCheckRuntime,
   event: PluginEvent,
@@ -57,8 +41,12 @@ export async function handleCompletionCheckEvent(
     return
   }
 
-  const isIdle = event.type === 'session.idle' || (event.type === 'session.status' && event.data.status.type === 'idle')
-  if (!isIdle) return
+  const executionEnded =
+    event.type === 'session.execution.succeeded' ||
+    event.type === 'session.execution.failed' ||
+    event.type === 'session.execution.interrupted'
+  if (!executionEnded) return
+  if (event.type === 'session.execution.interrupted' && event.data.reason === 'shutdown') return
 
   const sessionID = event.data.sessionID
   const command = store.get(sessionID)
@@ -67,7 +55,7 @@ export async function handleCompletionCheckEvent(
   processing.add(sessionID)
 
   try {
-    if (await sessionHitUsageLimitV2(ctx, sessionID)) {
+    if (event.type === 'session.execution.failed' && isUsageLimitError(event.data.error)) {
       // The agent was cut off by the provider's usage limit rather than
       // finishing. Skip the completion check (and the re-prompt).
       console.warn('[Completion Check] Skipped: usage limit reached.')
