@@ -46,7 +46,7 @@ V2:
 
 ```jsonc
 {
-  "plugin": [{ "package": "bacluc-opencode-completion-check-command@<version>", "options": { "maxRetries": 10 } }],
+  "plugins": [{ "package": "bacluc-opencode-completion-check-command@<version>", "options": { "maxRetries": 10 } }],
 }
 ```
 
@@ -75,7 +75,7 @@ The `/completion-check-command` is automatically registered by the plugin. In V1
 }
 ```
 
-In V2 the plugin registers the command through the plugin API (`ctx.command.transform`) and reads the raw arguments itself, so the template cannot be overridden with a `command` entry: a same-named `command.completion-check-command` from config replaces the plugin's implementation and breaks command registration.
+In V2 the plugin registers the command through the plugin API (`ctx.command.transform`) and reads the raw arguments itself, so the template cannot be overridden with a `commands` entry: a same-named `commands.completion-check-command` from config replaces the plugin's implementation and breaks command registration.
 
 ### Default Command Sources
 
