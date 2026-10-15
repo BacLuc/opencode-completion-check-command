@@ -7,6 +7,12 @@ on:
       - unlabeled
       - closed
 
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+
 jobs:
   create-release-tag:
     runs-on: ubuntu-latest
